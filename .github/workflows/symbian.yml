@@ -166,6 +166,8 @@ jobs:
               extern volatile int shim_console_on;
               extern volatile int shim_quit;
               extern volatile int shim_pause;
+              extern volatile unsigned int shim_present_count;
+              extern volatile int shim_frameskip_enable;
               void shim_set_input(unsigned aKeys, int aTouchDown, int aX, int aY);
               int shim_audio_mix(short* aStereo, int aFrames);
               int shim_load_databins(void);
@@ -640,6 +642,16 @@ jobs:
                   Re4Log("GAME THREAD DIED: type=%d reason=%d category=%s", (TInt)iGame.ExitType(),
                          iGame.ExitReason(), (const char*)cat8.Ptr());
                   }
+              // redraw only when the game presented a new picture or the pad changed (the window server is the slow part)
+              static unsigned lastPresent = 0xFFFFFFFFu;
+              static TUint lastHeld = 0xFFFFFFFFu;
+              TUint heldNow = iKeyBits | iPadBits;
+              if (lastPresent == shim_present_count && lastHeld == heldNow)
+                  {
+                  return;
+                  }
+              lastPresent = shim_present_count;
+              lastHeld = heldNow;
               host_lock();
               iTop->LockHeap();
               Mem::Copy(iTop->DataAddress(), shim_top, 256 * 192 * 4);
@@ -1145,7 +1157,8 @@ jobs:
                   r8.Copy(gRoot);
                   r8.ZeroTerminate();
                   Re4Log("game thread: data root %s", (const char*)r8.Ptr());
-                  shim_load_databins();
+                  shim_frameskip_enable = 1;      // behind the 60 Hz schedule: drop the 3D pass of some frames
+              shim_load_databins();
                   Re4Log("game thread: calling re4_main");
                   re4_main();
                   Re4Log("game thread: re4_main returned");
@@ -1345,12 +1358,22 @@ jobs:
 
           static u32 vb_next3;         /* next vblank time, in 1/3 ms */
           volatile u32 shim_frame_no;
+          volatile u32 shim_present_count;     /* bumped by every shim_present: the front end redraws only on a change */
+          volatile int shim_skip_render;       /* 1: the next 3D pass (glFlush) is skipped, the last picture stays */
+          volatile int shim_frameskip_enable;  /* set by the Symbian front end only (the host test keeps every frame) */
+          static int skip_run, skip_present;
+          #define SHIM_MAX_SKIP 24
           void shim_present(void);
 
           void swiWaitForVBlank(void)
           {
               shim_dma_run();
-              shim_present();
+              /* a frame whose 3D pass was skipped shows nothing new: only now and then update sprites / sub screen */
+              if (!shim_skip_render || ++skip_present >= 4)
+              {
+                  skip_present = 0;
+                  shim_present();
+              }
               if (shim_pause)
               {
                   while (shim_pause && !shim_quit) host_sleep_ms(40);
@@ -1359,9 +1382,22 @@ jobs:
               u32 now = host_ticks_ms();
               if (!vb_next3) vb_next3 = now * 3;
               vb_next3 += 50;                         /* 16.67 ms */
-              u32 target = vb_next3 / 3;
-              if (target > now) host_sleep_ms(target - now);
-              else if (now - target > 100) vb_next3 = now * 3;
+              int late = (int)(now - vb_next3 / 3);   /* ms behind the 60 Hz schedule */
+              if (late < 0)
+              {
+                  host_sleep_ms((unsigned)-late);
+                  shim_skip_render = 0; skip_run = 0;
+              }
+              else if (shim_frameskip_enable && late > 4 && skip_run < SHIM_MAX_SKIP)
+              {
+                  /* behind: drop the next frame's rasterising (the costly part), keep the game logic on time */
+                  shim_skip_render = 1; skip_run++;
+              }
+              else
+              {
+                  shim_skip_render = 0; skip_run = 0;
+              }
+              if (late > (shim_frameskip_enable ? 1500 : 100)) vb_next3 = now * 3;   /* a long stall: do not chase it */
               IntFn f = irq_fn[0];
               if (f) f();
               shim_frame_no++;
@@ -1514,16 +1550,15 @@ jobs:
                   lvl = shim_bldy & 31;
               if (lvl > 16) lvl = 16;
               static u32 top[256 * 192], bot[256 * 192];
-              for (int i = 0; i < 256 * 192; i++)
-              {
-                  u32 c = shim_fb3d[i];
-                  if (lvl)
+              if (lvl)
+                  for (int i = 0; i < 256 * 192; i++)
                   {
+                      u32 c = shim_fb3d[i];
                       u32 r = ((c >> 16) & 255) * (16 - lvl) >> 4, g = ((c >> 8) & 255) * (16 - lvl) >> 4, b = (c & 255) * (16 - lvl) >> 4;
-                      c = r << 16 | g << 8 | b;
+                      top[i] = r << 16 | g << 8 | b;
                   }
-                  top[i] = c;
-              }
+              else
+                  memcpy(top, shim_fb3d, sizeof top);
               draw_sprites(top);
               if (bright[0]) for (int i = 0; i < 256 * 192; i++) top[i] = shade(top[i], bright[0]);
               if (shim_console_on)
@@ -1539,6 +1574,7 @@ jobs:
               memcpy(shim_top, lcd_swap ? bot : top, sizeof top);
               memcpy(shim_bot, lcd_swap ? top : bot, sizeof bot);
               host_unlock();
+              shim_present_count++;
           }
 
           /* ------------------------------------------------------------------ sound */
@@ -1671,6 +1707,7 @@ jobs:
           #include "nds.h"
 
           IntFn shim_irq_handler(int bit);
+          extern volatile int shim_skip_render;
 
           u32 shim_fb3d[256 * 192];
           static u16 zbuf[256 * 192];
@@ -1978,7 +2015,7 @@ jobs:
               s64 d = ((nz + 4096) * 0x7FFF) >> 13;
               if (d < 0) d = 0; if (d > 0x7FFF) d = 0x7FFF;
               o->sx = (int)sx; o->sy = (int)sy; o->z = (int)d;
-              o->iw = (int)(((s64)1 << 34) / w);
+              o->iw = (int)(rw >> 10);            /* 2^34 / w, from the reciprocal already made */
               o->u = c->u; o->v = c->v; o->r = c->r; o->g = c->g; o->b = c->b;
           }
 
@@ -2116,18 +2153,34 @@ jobs:
               const int nat = textured ? 7 : 5;
               s64 A[7][3];
               const SV *vs[3] = { a, b, c };
+              /* perspective only where it shows: a small or nearly flat-on triangle is interpolated linearly */
+              int persp = 0;
+              if (textured)
+              {
+                  int imin = a->iw, imax = a->iw;
+                  if (b->iw < imin) imin = b->iw; if (b->iw > imax) imax = b->iw;
+                  if (c->iw < imin) imin = c->iw; if (c->iw > imax) imax = c->iw;
+                  int spread = imax - imin;
+                  s64 ex = (x0 > x1 ? x0 : x1) > x2 ? (x0 > x1 ? x0 : x1) : x2;
+                  s64 nx = (x0 < x1 ? x0 : x1) < x2 ? (x0 < x1 ? x0 : x1) : x2;
+                  int small = (ex - nx) < 24 * 16 && (bt->sy - t->sy) < 24 * 16;
+                  persp = !(spread * 16 < imin || (small && spread * 4 < imin));
+              }
               for (int i = 0; i < 3; i++)
               {
                   A[0][i] = (s64)vs[i]->z << 8;
                   A[1][i] = (s64)vs[i]->r << 16; A[2][i] = (s64)vs[i]->g << 16; A[3][i] = (s64)vs[i]->b << 16;
                   A[4][i] = vs[i]->iw;
-                  A[5][i] = (s64)vs[i]->u * vs[i]->iw; A[6][i] = (s64)vs[i]->v * vs[i]->iw;
+                  if (persp) { A[5][i] = (s64)vs[i]->u * vs[i]->iw; A[6][i] = (s64)vs[i]->v * vs[i]->iw; }
+                  else { A[5][i] = (s64)vs[i]->u << 8; A[6][i] = (s64)vs[i]->v << 8; }
               }
               s64 gx[7], gy[7];
               static const int shf[7] = { 8, 8, 8, 8, 8, 0, 0 };
               for (int k = 0; k < nat; k++)
               {
+                  if (k == 4 && !persp) { gx[4] = gy[4] = 0; continue; }          /* (1/w is only needed for perspective) */
                   s64 d1 = A[k][1] - A[k][0], d2 = A[k][2] - A[k][0];
+                  if (k >= 1 && k <= 3 && !d1 && !d2) { gx[k] = gy[k] = 0; continue; }   /* flat colour: no gradient */
                   gx[k] = ((d1 * (y2 - y0) - d2 * (y1 - y0)) << shf[k]) / area;
                   gy[k] = ((d2 * (x1 - x0) - d1 * (x2 - x0)) << shf[k]) / area;
               }
@@ -2166,24 +2219,30 @@ jobs:
                   int dz = (int)(gx[0] >> 4), dr = (int)(gx[1] >> 4), dg = (int)(gx[2] >> 4), db = (int)(gx[3] >> 4);
 
                   int u = 0, v = 0, du = 0, dv = 0;
-                  int span = 0;
-                  s64 uw = at[5], vw = at[6], iw = at[4];
+                  int span = 0, eu = 0, ev = 0;
+                  if (textured && !persp) { u = (int)at[5]; v = (int)at[6]; du = (int)(gx[5] * 16); dv = (int)(gx[6] * 16); }
                   u32 *fb = shim_fb3d + row * 256;
                   u16 *zb = zbuf + row * 256;
                   for (int x = px0; x < px1; x++, z += dz, r += dr, g += dg, bl += db)
                   {
-                      if (textured && span == 0)
+                      if (persp && span == 0)
                       {
-                          int n = px1 - x < 8 ? px1 - x : 8;
-                          s64 iw0 = at[4] + ((gx[4] * 16 * (x - px0)) >> 8);
-                          s64 uw0 = at[5] + gx[5] * 16 * (x - px0), vw0 = at[6] + gx[6] * 16 * (x - px0);
-                          s64 iw1 = iw0 + ((gx[4] * 16 * n) >> 8);
-                          s64 uw1 = uw0 + gx[5] * 16 * n, vw1 = vw0 + gx[6] * 16 * n;
-                          if (iw0 < 1) iw0 = 1;
+                          /* 16-pixel spans, perspective-correct at their ends; each end is the next span's start */
+                          int n = px1 - x < 16 ? px1 - x : 16;
+                          if (x == px0)
+                          {
+                              s64 i0 = at[4] < 1 ? 1 : at[4];
+                              eu = (int)((at[5] * 256) / i0); ev = (int)((at[6] * 256) / i0);
+                          }
+                          s64 off = (s64)16 * (x - px0 + n);
+                          s64 iw1 = at[4] + ((gx[4] * off) >> 8);
+                          s64 uw1 = at[5] + gx[5] * off, vw1 = at[6] + gx[6] * off;
                           if (iw1 < 1) iw1 = 1;
-                          int u0 = (int)((uw0 * 256) / iw0), v0 = (int)((vw0 * 256) / iw0);
                           int u1 = (int)((uw1 * 256) / iw1), v1 = (int)((vw1 * 256) / iw1);
-                          u = u0; v = v0; du = (u1 - u0) / n; dv = (v1 - v0) / n;
+                          u = eu; v = ev;
+                          if (n == 16) { du = (u1 - eu) >> 4; dv = (v1 - ev) >> 4; }
+                          else { du = (u1 - eu) / n; dv = (v1 - ev) / n; }
+                          eu = u1; ev = v1;
                           span = n;
                       }
                       int zi = z >> 8;
@@ -2236,7 +2295,6 @@ jobs:
                       fb[x] = (pr & 255) << 16 | (pg & 255) << 8 | (pb & 255);
                       if (wdepth) zb[x] = (u16)zi;
                   }
-                  (void)uw; (void)vw; (void)iw;
               }
           }
 
@@ -2280,7 +2338,7 @@ jobs:
                   {
                       const Poly *p = &polys[i];
                       if (p->trans != pass) continue;
-                      if (p->line) { raster_line(p); continue; }
+                      if (p->line) { if (!p->tex) raster_line(p); continue; }   /* (a textured sliver would be a white line) */
                       for (int k = 1; k + 1 < p->n; k++) raster_tri(p, &p->v[0], &p->v[k], &p->v[k + 1]);
                   }
           }
@@ -2297,7 +2355,7 @@ jobs:
                   host_log(m);
                   first = 0;
               }
-              render_all();
+              if (!shim_skip_render) render_all();
               npoly = nvert = 0;
           }
 
@@ -2315,9 +2373,16 @@ jobs:
           void glClearPolyID(u8 id) { (void)id; }
           void glClearDepth(int d) { clr_depth = d & 0x7FFF; }
           void glFogColor(u8 r, u8 g, u8 b, u8 a) { (void)a; fog_r = r & 31; fog_g = g & 31; fog_b = b & 31; }
-          void glFogShift(int s) { fog_shift = s & 15; fog_dirty = 1; }
-          void glFogOffset(int o) { fog_off = o; fog_dirty = 1; }
-          void glFogDensity(int i, int d) { if (i >= 0 && i < 32) { fog_tab[i] = (u8)(d > 127 ? 127 : d); fog_dirty = 1; } }
+          void glFogShift(int s) { s &= 15; if (s != fog_shift) { fog_shift = s; fog_dirty = 1; } }
+          void glFogOffset(int o) { if (o != fog_off) { fog_off = o; fog_dirty = 1; } }
+          void glFogDensity(int i, int d)
+          {
+              if (i >= 0 && i < 32)
+              {
+                  u8 v = (u8)(d > 127 ? 127 : d);
+                  if (fog_tab[i] != v) { fog_tab[i] = v; fog_dirty = 1; }
+              }
+          }
 
           u32 shim_gfx_status(void) { shim_dma_run(); return 0; }
           u32 shim_poly_ram(void) { shim_dma_run(); return (u32)npoly; }
@@ -2904,6 +2969,13 @@ jobs:
           __attribute__((weak)) void *memcpy(void *d, const void *s, size_t n)
           {
               unsigned char *a = (unsigned char *)d; const unsigned char *b = (const unsigned char *)s;
+              if ((((unsigned long)a | (unsigned long)b) & 3) == 0)
+              {
+                  unsigned *wa = (unsigned *)a; const unsigned *wb = (const unsigned *)b;
+                  for (; n >= 16; n -= 16) { wa[0] = wb[0]; wa[1] = wb[1]; wa[2] = wb[2]; wa[3] = wb[3]; wa += 4; wb += 4; }
+                  for (; n >= 4; n -= 4) *wa++ = *wb++;
+                  a = (unsigned char *)wa; b = (const unsigned char *)wb;
+              }
               while (n--) *a++ = *b++;
               return d;
           }
@@ -2917,7 +2989,15 @@ jobs:
           __attribute__((weak)) void *memset(void *d, int c, size_t n)
           {
               unsigned char *a = (unsigned char *)d;
-              while (n--) *a++ = (unsigned char)c;
+              unsigned char v = (unsigned char)c;
+              if ((((unsigned long)a) & 3) == 0)
+              {
+                  unsigned w = v * 0x01010101u, *wa = (unsigned *)a;
+                  for (; n >= 16; n -= 16) { wa[0] = w; wa[1] = w; wa[2] = w; wa[3] = w; wa += 4; }
+                  for (; n >= 4; n -= 4) *wa++ = w;
+                  a = (unsigned char *)wa;
+              }
+              while (n--) *a++ = v;
               return d;
           }
           __attribute__((weak)) int memcmp(const void *x, const void *y, size_t n)
