@@ -707,8 +707,9 @@ jobs:
               iBtn[6] = TRect(fx - bs / 2, cy - bs / 2 - bs + 4, fx + bs / 2, cy - bs / 2 + 4);       // X top
               iBtn[7] = TRect(fx - bs / 2 - bs, cy - bs / 2, fx - bs / 2, cy + bs / 2);                // Y left
               TInt mx = w / 2;
-              iBtn[0] = TRect(mx - 150, sh + 6, mx - 80, sh + 6 + hs / 3);                             // L
-              iBtn[1] = TRect(mx + 80, sh + 6, mx + 150, sh + 6 + hs / 3);                             // R
+              TInt cw = w / 9, ch = h / 8;                                                            // shoulder buttons: top corners
+              iBtn[0] = TRect(0, 0, cw, ch);                                                           // L
+              iBtn[1] = TRect(w - cw, 0, w, ch);                                                       // R
               iBtn[2] = TRect(mx - 70, cy - hs / 6, mx - 5, cy + hs / 6);                              // SELECT
               iBtn[3] = TRect(mx + 5, cy - hs / 6, mx + 70, cy + hs / 6);                              // START
               iBtn[8] = TRect(mx - 40, h - hs / 3 - 2, mx + 40, h - 2);                                // QUIT
@@ -755,7 +756,7 @@ jobs:
                       continue;
                       }
                   const TPoint& pt = iPtrPos[i];
-                  if (iBotRect.Contains(pt))
+                  if (iBotRect.Contains(pt) && !iBtn[0].Contains(pt) && !iBtn[1].Contains(pt))
                       {
                       if (!touch)
                           {
@@ -2020,7 +2021,7 @@ jobs:
 
           /* ------------------------------------------------------ polygon buffer */
           typedef struct { int sx, sy, z, iw, u, v; u8 r, g, b, pad; } SV;
-          typedef struct { u32 attr; int tex; u8 n, trans, line, pad; SV v[6]; } Poly;
+          typedef struct { u32 attr; int tex; u8 n, trans, line, pad; SV v[10]; } Poly;
           #define MAX_POLY 2048
           #define MAX_VERT 6144
           static Poly polys[MAX_POLY];
@@ -2059,9 +2060,20 @@ jobs:
               o->u = c->u; o->v = c->v; o->r = c->r; o->g = c->g; o->b = c->b;
           }
 
+          static s64 plane_d(const CV *v, int pl)      /* >= 0: inside the left / right / bottom / top side */
+          {
+              switch (pl)
+              {
+              case 0: return (s64)v->x + v->w;
+              case 1: return (s64)v->w - v->x;
+              case 2: return (s64)v->y + v->w;
+              default: return (s64)v->w - v->y;
+              }
+          }
+
           static void emit(const CV *in, int n)
           {
-              CV a[8], b[8];
+              CV a[12], b[12];
               int m = 0;
               for (int i = 0; i < n; i++)
               {
@@ -2072,10 +2084,29 @@ jobs:
                       lerp_cv(&a[m++], p, q, (dp << 16) / (dp - dq));
               }
               if (m < 3) return;
+              /* the four sides of the view too, as the hardware does: a big floor / wall polygon would otherwise get
+                 screen coordinates far outside the viewport, be clamped and its texture smear into streaks */
+              for (int pl = 0; pl < 4; pl++)
+              {
+                  int neg = 0;
+                  for (int i = 0; i < m; i++) if (plane_d(&a[i], pl) < 0) neg++;
+                  if (neg == 0) continue;
+                  if (neg == m) return;                      /* wholly outside this side: nothing to draw */
+                  int k = 0;
+                  for (int i = 0; i < m; i++)
+                  {
+                      const CV *p = &a[i], *q = &a[(i + 1) % m];
+                      s64 dp = plane_d(p, pl), dq = plane_d(q, pl);
+                      if (dp >= 0) b[k++] = *p;
+                      if ((dp >= 0) != (dq >= 0)) lerp_cv(&b[k++], p, q, (dp << 16) / (dp - dq));
+                  }
+                  for (int i = 0; i < k; i++) a[i] = b[i];
+                  m = k;
+                  if (m < 3) return;
+              }
               int out_far = 0;
               for (int i = 0; i < m; i++) if (a[i].z > a[i].w) out_far++;
               if (out_far == m) return;
-              (void)b;
               if (npoly >= MAX_POLY || nvert + m > MAX_VERT) { shim_gfx_control |= 1 << 13; return; }
 
               Poly *p = &polys[npoly];
@@ -2412,8 +2443,8 @@ jobs:
                   shim_last_render = t1;
                   u32 dt = t1 - t0;
                   /* a slow pass: draw in 2x2 blocks until it is cheap enough to go back to full resolution */
-                  if (shim_lowres) { if (dt < 18) shim_lowres = 0; }
-                  else if (dt > 70) shim_lowres = 1;
+                  if (shim_lowres) { if (dt < 14) shim_lowres = 0; }
+                  else if (dt > 55) shim_lowres = 1;
               }
               npoly = nvert = 0;
           }
@@ -2496,6 +2527,7 @@ jobs:
               case 0x22: cu = (s16)p[0]; cv = (s16)(p[0] >> 16); break;
               case 0x23: vertex((s16)p[0], (s16)(p[0] >> 16), (s16)p[1]); break;
               case 0x24: vertex(((int)(p[0] << 22) >> 22) << 6, ((int)(p[0] << 12) >> 22) << 6, ((int)(p[0] << 2) >> 22) << 6); break;
+              case 0x28: vertex(lx + (((int)(p[0] << 22)) >> 22), ly + (((int)(p[0] << 12)) >> 22), lz + (((int)(p[0] << 2)) >> 22)); break;
               case 0x25: vertex((s16)p[0], (s16)(p[0] >> 16), lz); break;
               case 0x26: vertex((s16)p[0], ly, (s16)(p[0] >> 16)); break;
               case 0x27: vertex(lx, (s16)p[0], (s16)(p[0] >> 16)); break;
