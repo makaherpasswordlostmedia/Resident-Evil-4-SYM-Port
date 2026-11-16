@@ -45,7 +45,7 @@ jobs:
           $gid = '${{ inputs.gdrive_id }}'
           if ($gid) {
             python -m pip install --quiet gdown
-            python -m gdown --id $gid -O input/zeebo.zip
+            python -m gdown $gid -O input/zeebo.zip
             if ($LASTEXITCODE -ne 0) { throw 'gdown failed - is the file shared as "Anyone with the link"?' }
           } elseif ($url) {
             Invoke-WebRequest -Uri $url -OutFile input/zeebo.zip -MaximumRedirection 10
