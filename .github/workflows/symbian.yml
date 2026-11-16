@@ -1361,8 +1361,10 @@ jobs:
           volatile u32 shim_present_count;     /* bumped by every shim_present: the front end redraws only on a change */
           volatile int shim_skip_render;       /* 1: the next 3D pass (glFlush) is skipped, the last picture stays */
           volatile int shim_frameskip_enable;  /* set by the Symbian front end only (the host test keeps every frame) */
+          volatile u32 shim_last_render;       /* host_ticks_ms() when the last 3D pass finished */
           static int skip_run, skip_present;
-          #define SHIM_MAX_SKIP 24
+          #define SHIM_MAX_SKIP 30
+          #define SHIM_MAX_STALE_MS 90        /* the picture is never older than this (about 11 fps on screen at worst) */
           void shim_present(void);
 
           void swiWaitForVBlank(void)
@@ -1388,7 +1390,7 @@ jobs:
                   host_sleep_ms((unsigned)-late);
                   shim_skip_render = 0; skip_run = 0;
               }
-              else if (shim_frameskip_enable && late > 4 && skip_run < SHIM_MAX_SKIP)
+              else if (shim_frameskip_enable && late > 4 && skip_run < SHIM_MAX_SKIP && (now - shim_last_render) < SHIM_MAX_STALE_MS)
               {
                   /* behind: drop the next frame's rasterising (the costly part), keep the game logic on time */
                   shim_skip_render = 1; skip_run++;
@@ -1708,6 +1710,8 @@ jobs:
 
           IntFn shim_irq_handler(int bit);
           extern volatile int shim_skip_render;
+          extern volatile u32 shim_last_render;
+          static int shim_lowres;              /* 1: rasterise every second row / column (2x2 blocks), 4x cheaper */
 
           u32 shim_fb3d[256 * 192];
           static u16 zbuf[256 * 192];
@@ -2199,7 +2203,9 @@ jobs:
               const int ws = tx ? tx->wrap_s : 0, wt = tx ? tx->wrap_t : 0;
               const u32 fogc = (fog_r << 3 | fog_r >> 2) << 16 | (fog_g << 3 | fog_g >> 2) << 8 | (fog_b << 3 | fog_b >> 2);
 
-              for (int row = row0; row < row1; row++)
+              const int S = shim_lowres ? 2 : 1;
+              if (S == 2) row0 += row0 & 1;
+              for (int row = row0; row < row1; row += S)
               {
                   s64 cy = row * 16 + 8;
                   s64 xa = ((s64)t->sx << 16) + sl_long * (cy - t->sy), xb;
@@ -2210,22 +2216,23 @@ jobs:
                   if (px0 < 0) px0 = 0;
                   if (px1 > 256) px1 = 256;
                   if (px0 >= px1) continue;
+                  if (S == 2) px0 &= ~1;
 
                   s64 dX = (s64)px0 * 16 + 8 - x0, dY = cy - y0;
                   s64 at[7];
                   for (int k = 0; k < nat; k++) at[k] = A[k][0] + ((gx[k] * dX + gy[k] * dY) >> shf[k]);
                   int z = (int)at[0];
                   int r = (int)at[1], g = (int)at[2], bl = (int)at[3];
-                  int dz = (int)(gx[0] >> 4), dr = (int)(gx[1] >> 4), dg = (int)(gx[2] >> 4), db = (int)(gx[3] >> 4);
+                  int dz = (int)(gx[0] >> 4) * S, dr = (int)(gx[1] >> 4) * S, dg = (int)(gx[2] >> 4) * S, db = (int)(gx[3] >> 4) * S;
 
                   int u = 0, v = 0, du = 0, dv = 0;
                   int span = 0, eu = 0, ev = 0;
-                  if (textured && !persp) { u = (int)at[5]; v = (int)at[6]; du = (int)(gx[5] * 16); dv = (int)(gx[6] * 16); }
+                  if (textured && !persp) { u = (int)at[5]; v = (int)at[6]; du = (int)(gx[5] * 16) * S; dv = (int)(gx[6] * 16) * S; }
                   u32 *fb = shim_fb3d + row * 256;
                   u16 *zb = zbuf + row * 256;
-                  for (int x = px0; x < px1; x++, z += dz, r += dr, g += dg, bl += db)
+                  for (int x = px0; x < px1; x += S, z += dz, r += dr, g += dg, bl += db)
                   {
-                      if (persp && span == 0)
+                      if (persp && span <= 0)
                       {
                           /* 16-pixel spans, perspective-correct at their ends; each end is the next span's start */
                           int n = px1 - x < 16 ? px1 - x : 16;
@@ -2242,6 +2249,7 @@ jobs:
                           u = eu; v = ev;
                           if (n == 16) { du = (u1 - eu) >> 4; dv = (v1 - ev) >> 4; }
                           else { du = (u1 - eu) / n; dv = (v1 - ev) / n; }
+                          du *= S; dv *= S;
                           eu = u1; ev = v1;
                           span = n;
                       }
@@ -2249,7 +2257,7 @@ jobs:
                       if (zi < 0) zi = 0; if (zi > 0x7FFF) zi = 0x7FFF;
                       if (eqtest ? (zi - zb[x] > 0x200 || zb[x] - zi > 0x200) : (zi >= zb[x]))
                       {
-                          if (textured) { u += du; v += dv; span--; }
+                          if (textured) { u += du; v += dv; span -= S; }
                           continue;
                       }
                       int cr5 = r >> 16, cg5 = g >> 16, cb5 = bl >> 16;
@@ -2264,7 +2272,7 @@ jobs:
                           if (ws) ui &= tw - 1; else if (ui < 0) ui = 0; else if (ui >= tw) ui = tw - 1;
                           if (wt) vi &= th - 1; else if (vi < 0) vi = 0; else if (vi >= th) vi = th - 1;
                           u32 tc = tx->px[vi * tw + ui];
-                          u += du; v += dv; span--;
+                          u += du; v += dv; span -= S;
                           u32 ta = tc >> 24;
                           if (ta == 0) continue;
                           pr = (((tc >> 16) & 255) * (cr5 + 1)) >> 5;
@@ -2294,6 +2302,11 @@ jobs:
                       }
                       fb[x] = (pr & 255) << 16 | (pg & 255) << 8 | (pb & 255);
                       if (wdepth) zb[x] = (u16)zi;
+                      if (S == 2)
+                      {
+                          fb[x + 1] = fb[x + 256] = fb[x + 257] = fb[x];
+                          if (wdepth) zb[x + 1] = zb[x + 256] = zb[x + 257] = (u16)zi;
+                      }
                   }
               }
           }
@@ -2355,7 +2368,17 @@ jobs:
                   host_log(m);
                   first = 0;
               }
-              if (!shim_skip_render) render_all();
+              if (!shim_skip_render)
+              {
+                  u32 t0 = host_ticks_ms();
+                  render_all();
+                  u32 t1 = host_ticks_ms();
+                  shim_last_render = t1;
+                  u32 dt = t1 - t0;
+                  /* a slow pass: draw in 2x2 blocks until it is cheap enough to go back to full resolution */
+                  if (shim_lowres) { if (dt < 18) shim_lowres = 0; }
+                  else if (dt > 70) shim_lowres = 1;
+              }
               npoly = nvert = 0;
           }
 
