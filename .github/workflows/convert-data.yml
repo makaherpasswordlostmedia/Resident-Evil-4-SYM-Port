@@ -1,0 +1,104 @@
+name: Convert RE4 data (Windows)
+
+# Runs re4zeebo/export_all.ps1 on a Windows runner and hands back ds/data + ds/nitrofs as a zip
+# artifact for E:\RE4DS\ on the phone. Music cannot be recorded here (no audio device on the
+# runner), so a valid empty music.bin is written: the game starts without music.
+#
+# The game data is YOUR copy of "Resident Evil 4 - Zeebo Edition": use a PRIVATE repository
+# (artifacts of public repositories can be downloaded by any GitHub user) and do not share the result.
+#
+# Zip source, one of:
+#   gdrive_id    Google Drive file ID (the part after /d/ in the share link), shared to anyone with the link
+#   zip_url      direct download link of the zip (cloud / own server)
+#   release_tag  tag of a release in THIS repository that has the zip attached as an asset
+
+on:
+  workflow_dispatch:
+    inputs:
+      gdrive_id:
+        description: 'Google Drive file ID of the zip (file shared as "Anyone with the link")'
+        required: false
+        default: ''
+      zip_url:
+        description: 'Direct download URL of the Zeebo zip (leave empty to use a release asset)'
+        required: false
+        default: ''
+      release_tag:
+        description: 'Release tag of this repo that holds the zip (used when zip_url is empty)'
+        required: false
+        default: 'zeebo'
+
+jobs:
+  convert:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get the Zeebo zip
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force input | Out-Null
+          $url = '${{ inputs.zip_url }}'
+          $gid = '${{ inputs.gdrive_id }}'
+          if ($gid) {
+            python -m pip install --quiet gdown
+            python -m gdown --id $gid -O input/zeebo.zip
+            if ($LASTEXITCODE -ne 0) { throw 'gdown failed - is the file shared as "Anyone with the link"?' }
+          } elseif ($url) {
+            Invoke-WebRequest -Uri $url -OutFile input/zeebo.zip -MaximumRedirection 10
+          } else {
+            gh release download '${{ inputs.release_tag }}' --repo '${{ github.repository }}' --pattern '*.zip' --dir input --clobber
+            $z = Get-ChildItem input -Filter *.zip | Select-Object -First 1
+            if (-not $z) { throw 'no zip found in the release' }
+            Move-Item $z.FullName input/zeebo.zip -Force
+          }
+          $len = (Get-Item input/zeebo.zip).Length
+          Write-Host "zip size: $len bytes"
+          if ($len -lt 1MB) { throw 'downloaded file is too small - not the game zip (wrong link / login page?)' }
+
+      - name: Title picture placeholder (only if the repo has none)
+        shell: pwsh
+        run: |
+          $p = 'assets/title/title_ds_edition_source.png'
+          if (-not (Test-Path $p)) {
+            New-Item -ItemType Directory -Force assets/title | Out-Null
+            Add-Type -AssemblyName System.Drawing
+            $bmp = [System.Drawing.Bitmap]::new(1109, 832)
+            $bmp.Save((Join-Path (Get-Location) $p), [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose()
+            Write-Host 'wrote a black placeholder title picture'
+          }
+
+      - name: Convert
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse re4zeebo | Unblock-File
+          if (-not (Test-Path re4zeebo/export_all.ps1)) { throw 're4zeebo/export_all.ps1 is missing in this repository' }
+          ./re4zeebo/export_all.ps1 -InputPath (Resolve-Path input/zeebo.zip).Path -NoMusic
+
+      - name: Silent music.bin (the game needs the file to exist)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ds/data | Out-Null
+          if (-not (Test-Path ds/data/music.bin)) {
+            # "RMU1", 0 tracks, 16384 Hz
+            [IO.File]::WriteAllBytes((Join-Path (Get-Location) 'ds/data/music.bin'), [byte[]](0x52,0x4D,0x55,0x31,0,0,0,0x40))
+            Write-Host 'wrote an empty music.bin'
+          }
+
+      - name: Pack for the phone
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out/RE4DS | Out-Null
+          Copy-Item ds/data out/RE4DS/data -Recurse
+          Copy-Item ds/nitrofs out/RE4DS/nitrofs -Recurse
+          Get-ChildItem out/RE4DS -Recurse -File | Measure-Object Length -Sum | ForEach-Object { Write-Host "$($_.Count) files, $([math]::Round($_.Sum/1MB,1)) MB" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RE4DS
+          path: out/RE4DS
+          retention-days: 1
