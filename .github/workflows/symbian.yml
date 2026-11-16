@@ -39,7 +39,7 @@ jobs:
           cat > symbian/README.md <<'RE4_EOF'
           # Resident Evil 4 DS port - Symbian^3 layer
 
-          The game code in `ds/source` (C, libnds) is built **unmodified except for two small patches**
+          The game code in `ds/source` (C, libnds) is built **unmodified except for three small patches**
           (`tools/prepare.sh`) on top of a software implementation of the parts of the Nintendo DS the
           game uses. Nothing here is a rewrite of the game.
 
@@ -3209,6 +3209,13 @@ jobs:
           #    time here, so the table must be built at run time too
           grep -q 'static const void \*const data\[\] = { title_bin' "$OUT/main.c" || { echo "patch 2 target missing"; exit 1; }
           sed -i 's/static const void \*const data\[\] = { title_bin/const void *data[] = { title_bin/; s/static const size_t size\[\] = { title_bin_size/const size_t size[] = { title_bin_size/' "$OUT/main.c"
+
+          # 2b. model_sync() waits with  while (chain_at < chain_n || dmaBusy(..))  : on the DS the DMA2
+          #     interrupt advances chain_at, here only shim_dma_run() (called from dmaBusy) does. With
+          #     chain_at < chain_n the || short-circuits, dmaBusy is never called and the first gameplay
+          #     frame of a chunked stage spins forever. Call dmaBusy first so the chain is always pumped.
+          grep -q 'while (chain_at < chain_n || dmaBusy(ASYNC_DMA))' "$OUT/model.c" || { echo "patch 2b target missing"; exit 1; }
+          sed -i 's/while (chain_at < chain_n || dmaBusy(ASYNC_DMA))/while (dmaBusy(ASYNC_DMA) || chain_at < chain_n)/' "$OUT/model.c"
 
           # 3. data blobs: every  #include "NAME_bin.h"  becomes a pointer + size loaded from data/NAME.bin
           names=$(grep -h '#include "[A-Za-z0-9_]*_bin.h"' "$OUT"/*.c | sed 's/.*"\(.*\)_bin\.h".*/\1/' | sort -u)
