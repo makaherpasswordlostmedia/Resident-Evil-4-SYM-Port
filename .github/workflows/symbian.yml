@@ -235,7 +235,7 @@ jobs:
               void Tick();
               void ComputeLayout();
               void PushInput();
-              void ApplyPoint(const TPoint& aPt);
+              void Recompute();
               TUint ButtonsAt(const TPoint& aPt) const;
               void DrawButton(CWindowGc& aGc, const TRect& aRect, const TDesC& aLabel, TBool aDown) const;
               void DrawConsole(CWindowGc& aGc) const;
@@ -253,6 +253,9 @@ jobs:
               TBool iTouch;
               TInt iTouchX, iTouchY;
               TInt iQuitTick;
+              enum { KMaxPtr = 5 };
+              TBool iPtrDown[KMaxPtr];        // multi-touch: one slot per finger
+              TPoint iPtrPos[KMaxPtr];
 
               TRect iTopRect, iBotRect;
               TPoint iDpadC;
@@ -566,6 +569,7 @@ jobs:
               {
               CreateWindowL();
               SetExtentToWholeScreen();
+              Window().EnableAdvancedPointers();      // several fingers at once (pointer numbers on the events)
               EnableDragEvents();
               SetFocusing(ETrue);
 
@@ -620,6 +624,10 @@ jobs:
                   iKeyBits = 0;
                   iPadBits = 0;
                   iTouch = EFalse;
+                  for (TInt i = 0; i < KMaxPtr; ++i)
+                      {
+                      iPtrDown[i] = EFalse;
+                      }
                   PushInput();
                   }
               }
@@ -734,24 +742,48 @@ jobs:
               return bits;
               }
 
-          void CRe4Container::ApplyPoint(const TPoint& aPt)
+          void CRe4Container::Recompute()
               {
-              if (iBotRect.Contains(aPt))
+              // every finger that is down counts: the buttons / pad under any of them are held (so Y + a pad
+              // direction + the bottom screen work together); the first finger on the bottom screen is the stylus.
+              TUint pad = 0;
+              TBool touch = EFalse;
+              for (TInt i = 0; i < KMaxPtr; ++i)
                   {
-                  iTouch = ETrue;
-                  iTouchX = (aPt.iX - iBotRect.iTl.iX) * 256 / iBotRect.Width();
-                  iTouchY = (aPt.iY - iBotRect.iTl.iY) * 192 / iBotRect.Height();
-                  iPadBits = 0;
+                  if (!iPtrDown[i])
+                      {
+                      continue;
+                      }
+                  const TPoint& pt = iPtrPos[i];
+                  if (iBotRect.Contains(pt))
+                      {
+                      if (!touch)
+                          {
+                          touch = ETrue;
+                          iTouchX = (pt.iX - iBotRect.iTl.iX) * 256 / iBotRect.Width();
+                          iTouchY = (pt.iY - iBotRect.iTl.iY) * 192 / iBotRect.Height();
+                          }
+                      }
+                  else
+                      {
+                      pad |= ButtonsAt(pt);
+                      }
                   }
-              else
-                  {
-                  iTouch = EFalse;
-                  iPadBits = ButtonsAt(aPt);
-                  }
+              iTouch = touch;
+              iPadBits = pad;
               }
 
           void CRe4Container::HandlePointerEventL(const TPointerEvent& aEvent)
               {
+              TInt n = 0;
+              if (aEvent.IsAdvancedPointerEvent())
+                  {
+                  n = aEvent.AdvancedPointerEvent()->PointerNumber();
+                  }
+              if (n < 0 || n >= KMaxPtr)
+                  {
+                  return;
+                  }
               switch (aEvent.iType)
                   {
                   case TPointerEvent::EButton1Down:
@@ -765,18 +797,22 @@ jobs:
                               }
                           iQuitTick = now ? now : 1;
                           }
-                      ApplyPoint(aEvent.iPosition);
+                      iPtrDown[n] = ETrue;
+                      iPtrPos[n] = aEvent.iPosition;
                       break;
                   case TPointerEvent::EDrag:
-                      ApplyPoint(aEvent.iPosition);
+                      if (iPtrDown[n])
+                          {
+                          iPtrPos[n] = aEvent.iPosition;
+                          }
                       break;
                   case TPointerEvent::EButton1Up:
-                      iTouch = EFalse;
-                      iPadBits = 0;
+                      iPtrDown[n] = EFalse;
                       break;
                   default:
                       break;
                   }
+              Recompute();
               PushInput();
               }
 
