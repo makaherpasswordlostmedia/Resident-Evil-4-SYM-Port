@@ -2485,7 +2485,7 @@ jobs:
               if (cnt <= 0) return;
               if (t > 0 && tex[t].gl_dirty && tex[t].px)
               {
-                  gles2_tex_set(t, tex[t].w, tex[t].h, tex[t].wrap_s, tex[t].wrap_t, tex[t].px);
+                  gles2_tex_set(t, tex[t].w, tex[t].h, tex[t].wrap_s, tex[t].wrap_t, (const unsigned int *)tex[t].px);
                   tex[t].gl_dirty = 0;
               }
               gles2_draw(line, t, wd, eq, blend, gidx, cnt);
@@ -2566,7 +2566,7 @@ jobs:
                   }
                   gles_flush_batch(cl, ct, cw, ce, pass, cnt);
               }
-              return gles2_frame_end(shim_fb3d);
+              return gles2_frame_end((unsigned int *)shim_fb3d);   /* (u32 is unsigned long on Symbian, same size) */
           }
           #endif
 
