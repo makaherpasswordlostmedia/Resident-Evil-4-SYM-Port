@@ -175,6 +175,7 @@ jobs:
               }
 
           // ---- host services (re4ds_host.cpp) ----
+          void Re4Log(const char* aFmt, ...);   // appends a line to E:\\RE4DS\\re4ds.log (any thread)
           void Re4HostInitL();            // UI thread: lock + file root
           void Re4HostShutdown();
           TInt Re4GameThread(TAny*);      // the game's thread
@@ -243,6 +244,7 @@ jobs:
               CRe4Audio* iAudio;
               RThread iGame;
               TBool iGameStarted;
+              TBool iDeathLogged;
 
               TUint iKeyBits;       // hardware keys
               TUint iPadBits;       // on-screen buttons
@@ -312,7 +314,9 @@ jobs:
 
           void CRe4AppUi::ConstructL()
               {
+              Re4Log("---- RE4 DS start ----");
               BaseConstructL(CAknAppUi::EAknEnableSkin);
+              Re4Log("appui: base constructed");
               SetOrientationL(CAknAppUiBase::EAppUiOrientationLandscape);
               CEikStatusPane* sp = StatusPane();
               if (sp)
@@ -324,8 +328,15 @@ jobs:
                   {
                   cba->MakeVisible(EFalse);
                   }
-              iContainer = CRe4Container::NewL(ApplicationRect());
+              Re4Log("appui: creating container");
+              TRAPD(err, iContainer = CRe4Container::NewL(ApplicationRect()));
+              if (err != KErrNone)
+                  {
+                  Re4Log("appui: container NewL left with %d", err);
+                  User::Leave(err);
+                  }
               AddToStackL(iContainer);
+              Re4Log("appui: ready");
               }
 
           CRe4AppUi::~CRe4AppUi()
@@ -368,6 +379,7 @@ jobs:
 
           GLDEF_C TInt E32Main()
               {
+              Re4Log("E32Main entered");
               return EikStart::RunApplication(NewApplication);
               }
           RE4_EOF
@@ -556,9 +568,13 @@ jobs:
               SetFocusing(ETrue);
 
               iTop = new (ELeave) CFbsBitmap;
-              User::LeaveIfError(iTop->Create(TSize(256, 192), EColor16MU));
+              TInt berr = iTop->Create(TSize(256, 192), EColor16MU);
+              Re4Log("container: top bitmap %d", berr);
+              User::LeaveIfError(berr);
               iBot = new (ELeave) CFbsBitmap;
-              User::LeaveIfError(iBot->Create(TSize(256, 192), EColor16MU));
+              berr = iBot->Create(TSize(256, 192), EColor16MU);
+              Re4Log("container: bottom bitmap %d", berr);
+              User::LeaveIfError(berr);
 
               Re4HostInitL();
               TRAPD(aerr, iAudio = CRe4Audio::NewL());
@@ -566,10 +582,12 @@ jobs:
                   {
                   iAudio = NULL;
                   }
+              Re4Log("container: audio %d", aerr);
 
               // the game: own thread, own heap (96 MB max), 512 KB stack
               TInt err = iGame.Create(_L("re4ds_game"), Re4GameThread, 0x80000, 0x200000, 0x6000000,
                                       NULL, EOwnerProcess);
+              Re4Log("container: game thread create %d", err);
               User::LeaveIfError(err);
               iGame.SetPriority(EPriorityNormal);
               iGame.Resume();
@@ -612,6 +630,16 @@ jobs:
 
           void CRe4Container::Tick()
               {
+              if (iGameStarted && !iDeathLogged && iGame.ExitType() != EExitPending)
+                  {
+                  iDeathLogged = ETrue;
+                  TExitCategoryName cat = iGame.ExitCategory();
+                  TBuf8<KMaxExitCategoryName> cat8;
+                  cat8.Copy(cat);
+                  cat8.ZeroTerminate();
+                  Re4Log("GAME THREAD DIED: type=%d reason=%d category=%s", (TInt)iGame.ExitType(),
+                         iGame.ExitReason(), (const char*)cat8.Ptr());
+                  }
               host_lock();
               iTop->LockHeap();
               Mem::Copy(iTop->DataAddress(), shim_top, 256 * 192 * 4);
@@ -872,6 +900,9 @@ jobs:
           #include <e32base.h>
           #include <f32file.h>
           #include <string.h>
+          #include <stdio.h>
+          #include <stdarg.h>
+          #include <e32debug.h>
           #include "re4ds.h"
 
           static RFastLock gLock;
@@ -901,6 +932,44 @@ jobs:
 
           void host_lock(void) { if (gLockMade) gLock.Wait(); }
           void host_unlock(void) { if (gLockMade) gLock.Signal(); }
+
+          // One line per call: open / append / close, so nothing is lost when the process dies.
+          // Own file-server session per call, so it works from any thread and before the game thread exists.
+          void host_log(const char* aMsg)
+              {
+              TPtrC8 m((const TUint8*)aMsg);
+              RDebug::RawPrint(m);
+              RFs fs;
+              if (fs.Connect() != KErrNone)
+                  {
+                  return;
+                  }
+              static const TText* const paths[] = { _S("E:\\RE4DS\\re4ds.log"), _S("C:\\Data\\re4ds.log") };
+              for (TUint i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i)
+                  {
+                  TFileName name(paths[i]);
+                  fs.MkDirAll(name);
+                  RFile f;
+                  TInt err = f.Open(fs, name, EFileWrite | EFileShareAny);
+                  if (err == KErrNotFound)
+                      {
+                      err = f.Create(fs, name, EFileWrite | EFileShareAny);
+                      }
+                  if (err == KErrNone)
+                      {
+                      TInt pos = 0;
+                      f.Seek(ESeekEnd, pos);
+                      TBuf8<256> line;
+                      line.Append(m.Left(250));
+                      line.Append(_L8("\r\n"));
+                      f.Write(line);
+                      f.Flush();
+                      f.Close();
+                      break;
+                      }
+                  }
+              fs.Close();
+              }
 
           void host_exit_thread(void)
               {
@@ -1037,6 +1106,16 @@ jobs:
                   }
               }
 
+          void Re4Log(const char* aFmt, ...)
+              {
+              char buf[200];
+              va_list ap;
+              va_start(ap, aFmt);
+              vsnprintf(buf, sizeof buf, aFmt, ap);
+              va_end(ap);
+              host_log(buf);
+              }
+
           void Re4HostInitL()
               {
               if (!gLockMade)
@@ -1057,13 +1136,24 @@ jobs:
                   {
                   return KErrNoMemory;
                   }
+              Re4Log("game thread: started");
               if (gFs.Connect() == KErrNone)
                   {
                   PickRoot();
                   gFs.MkDirAll(gRoot);
+                  TBuf8<128> r8;
+                  r8.Copy(gRoot);
+                  r8.ZeroTerminate();
+                  Re4Log("game thread: data root %s", (const char*)r8.Ptr());
                   shim_load_databins();
+                  Re4Log("game thread: calling re4_main");
                   re4_main();
+                  Re4Log("game thread: re4_main returned");
                   gFs.Close();
+                  }
+              else
+                  {
+                  Re4Log("game thread: RFs connect failed");
                   }
               delete cleanup;
               return 0;
@@ -1275,6 +1365,12 @@ jobs:
               IntFn f = irq_fn[0];
               if (f) f();
               shim_frame_no++;
+              if (shim_frame_no == 1 || shim_frame_no == 2 || shim_frame_no == 60 || shim_frame_no == 600)
+              {
+                  char m[64];
+                  snprintf(m, sizeof m, "vblank frame %u", (unsigned)shim_frame_no);
+                  host_log(m);
+              }
               if (shim_quit) host_exit_thread();
           }
 
@@ -2193,6 +2289,14 @@ jobs:
           {
               (void)flags;
               shim_dma_run();
+              static int first = 1;
+              if (first)
+              {
+                  char m[64];
+                  snprintf(m, sizeof m, "first glFlush: %d polys", npoly);
+                  host_log(m);
+                  first = 0;
+              }
               render_all();
               npoly = nvert = 0;
           }
@@ -2758,6 +2862,7 @@ jobs:
           extern volatile int shim_pause;
           int shim_load_databins(void);          /* generated (databins.c) */
 
+          void host_log(const char *msg);          /* appends one line to E:\\RE4DS\\re4ds.log */
           u32 host_ticks_ms(void);
           void host_sleep_ms(u32 ms);
           void host_lock(void);
@@ -3079,6 +3184,7 @@ jobs:
           void host_sleep_ms(u32 ms) { (void)ms; }
           void host_lock(void) {}
           void host_unlock(void) {}
+          void host_log(const char *m) { (void)m; }
           RE4_EOF
           mkdir -p symbian/tools
           cat > symbian/tools/prepare.sh <<'RE4_EOF'
@@ -3133,14 +3239,17 @@ jobs:
               }
               if (!shim_console_on) consoleDemoInit();
               printf("missing: %s\n", path);
+              { char m[96]; snprintf(m, sizeof m, "missing: %s", path); host_log(m); }
               return 1;
           }
           int shim_load_databins(void)
           {
               int miss = 0;
+              host_log("loading data blobs");
           CEOF
             for n in $names; do echo "    miss += load_one(\"$n\", &${n}_bin, &${n}_bin_size);"; done
             cat <<'CEOF'
+              { char m[64]; snprintf(m, sizeof m, "data blobs done, %d missing", miss); host_log(m); }
               return miss;
           }
           CEOF
