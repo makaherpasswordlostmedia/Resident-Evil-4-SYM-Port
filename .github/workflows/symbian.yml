@@ -89,11 +89,11 @@ jobs:
           colour, translucency (opaque pass, then translucent in submission order), the DS fog table (uploaded as a
           256x128 lookup texture), depth write rules and degenerate-polygon lines are all done on the GPU.
 
-          * It is a **fallback chain**: no EGL config / pbuffer, a shader error, a failed self-test or a lost context
-            all drop back to the software rasterizer (the CPU copy of every texture is kept). The first lines of
-            `E:\RE4DS\re4ds.log` say which one is running (`renderer: OpenGL ES 2.0` / `renderer: software ...`).
-          * To force the software renderer, create an empty file `E:\RE4DS\nogles2.txt`.
-          * The repository variable `RE4_NO_GLES2` (any value) builds without it.
+          * **GLES 2 only**: with `RE4_GLES2` the software rasterizer is not used at all. If GLES 2 cannot start (no
+            EGL config, shader error, failed self-test) the 3D picture stays blank and `E:\\RE4DS\\re4ds.log` says why
+            (`renderer: GLES 2 FAILED ...`, vendor / renderer / version, self-test pixel values). A lost context is
+            re-created and the textures are uploaded again. The render target is the pbuffer, else an FBO.
+          * The build now fails when the SDK has no GLES 2 headers / import libraries.
           * Differences from the DS: colours are interpolated perspective-correct (the DS does it in screen space),
             and "depth equal" polygons are approximated by a 0x200 depth bias + `LEQUAL`.
           * The DS name clash (`glEnable`, `glFlush`, ...): `shim/nds.h` renames the colliding DS functions to `ds_*`,
@@ -2465,19 +2465,10 @@ jobs:
           static u16 gidx[MAX_VERT * 3];
           #define X8(c) ((u32)((c) << 3 | (c) >> 2))
 
-          static int gles_disabled(void)
-          {
-              FILE *f = fopen("nogles2.txt", "rb");      /* E:\RE4DS\nogles2.txt: force the software renderer */
-              if (!f) return 0;
-              fclose(f);
-              return 1;
-          }
-
           static void gles_start(void)
           {
-              if (gles_disabled()) { host_log("renderer: software (nogles2.txt)"); return; }
               if (gles2_init() == 0) { gles_on = 1; host_log("renderer: OpenGL ES 2.0"); }
-              else host_log("renderer: software (GLES 2 unavailable)");
+              else host_log("renderer: GLES 2 FAILED, no software fallback in this build: no 3D picture");
           }
 
           static void gles_flush_batch(int line, int t, int wd, int eq, int blend, int cnt)
@@ -2587,13 +2578,28 @@ jobs:
                   u32 t0 = host_ticks_ms();
                   int done = 0;
           #ifdef RE4_GLES2
-                  if (gles_on)
+                  /* GLES 2 only: the software rasterizer is not used in this build */
+                  done = 1;
+                  if (gles_on && render_gles())
                   {
-                      if (render_gles() == 0) done = 1;
-                      else { gles_on = 0; gles2_shutdown(); host_log("GLES 2 context lost: software renderer"); }
+                      host_log("GLES 2 context lost: re-creating");
+                      gles2_shutdown();
+                      gles_on = 0;
+                      if (gles2_init() == 0)
+                      {
+                          gles_on = 1;
+                          for (int i = 0; i < MAX_TEX; i++) tex[i].gl_dirty = tex[i].px ? 1 : 0;
+                          fog_gl_dirty = 1;
+                      }
                   }
+                  if (!gles_on)
+                  {
+                      u32 clear = (u32)(X8(clr_r) << 16 | X8(clr_g) << 8 | X8(clr_b));
+                      for (int i = 0; i < 256 * 192; i++) shim_fb3d[i] = clear;
+                  }
+          #else
+                  render_all();
           #endif
-                  if (!done) render_all();
                   u32 t1 = host_ticks_ms();
                   shim_last_render = t1;
                   u32 dt = t1 - t0;
@@ -2973,6 +2979,92 @@ jobs:
               gTexturedState = -1;
               }
 
+
+          // ---- render target: 0 = the pbuffer itself, 1 = FBO + RGBA texture, 2 = FBO + RGB565 renderbuffer
+          extern "C" { int gles2_force_mode = -1; }      // test hook: >= 0 tries only that mode
+          static int gMode = 0;
+          static GLuint gFbo, gColTex, gColRb, gDepthRb;
+
+          static void LogInt(const char* aTag, int a, int b, int c, int d)
+              {
+              char s[96];
+              int n = 0;
+              for (const char* t = aTag; *t && n < 40; ++t) s[n++] = *t;
+              int v[4] = { a, b, c, d };
+              for (int k = 0; k < 4; ++k)
+                  {
+                  s[n++] = ' ';
+                  int x = v[k];
+                  if (x < 0) { s[n++] = '-'; x = -x; }
+                  char r[12];
+                  int m = 0;
+                  do { r[m++] = (char)('0' + x % 10); x /= 10; } while (x && m < 11);
+                  while (m) s[n++] = r[--m];
+                  }
+              s[n] = 0;
+              host_log(s);
+              }
+
+          static int SetupTarget(int aMode)
+              {
+              while (glGetError() != GL_NO_ERROR) {}
+              if (aMode == 0)
+                  {
+                  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                  return 0;
+                  }
+              if (!gFbo) glGenFramebuffers(1, &gFbo);
+              if (!gDepthRb) glGenRenderbuffers(1, &gDepthRb);
+              glBindFramebuffer(GL_FRAMEBUFFER, gFbo);
+              glBindRenderbuffer(GL_RENDERBUFFER, gDepthRb);
+              glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, W3D, H3D);
+              glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, gDepthRb);
+              if (aMode == 1)
+                  {
+                  if (!gColTex) glGenTextures(1, &gColTex);
+                  glActiveTexture(GL_TEXTURE0);
+                  glBindTexture(GL_TEXTURE_2D, gColTex);
+                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, W3D, H3D, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+                  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gColTex, 0);
+                  glBindTexture(GL_TEXTURE_2D, 0);
+                  }
+              else
+                  {
+                  if (!gColRb) glGenRenderbuffers(1, &gColRb);
+                  glBindRenderbuffer(GL_RENDERBUFFER, gColRb);
+                  glRenderbufferStorage(GL_RENDERBUFFER, GL_RGB565, W3D, H3D);
+                  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, gColRb);
+                  }
+              GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+              if (st != GL_FRAMEBUFFER_COMPLETE)
+                  {
+                  LogInt("GLES2: fbo incomplete, status", (int)st, aMode, 0, 0);
+                  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                  return -1;
+                  }
+              return 0;
+              }
+
+          // clear to red and a second colour, read two pixels back
+          static int SelfTest(int aMode)
+              {
+              glViewport(0, 0, W3D, H3D);
+              glDepthMask(GL_TRUE);
+              glDisable(GL_BLEND);
+              glClearColor(1.f, 0.f, 0.f, 1.f);
+              glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+              unsigned char px[4] = { 9, 9, 9, 9 };
+              glReadPixels(10, 10, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+              GLenum err = glGetError();
+              LogInt("GLES2: self-test mode/r/g/b", aMode, px[0], px[1], px[2]);
+              LogInt("GLES2: self-test glerr/egl", (int)err, (int)eglGetError(), 0, 0);
+              return (px[0] > 200 && px[1] < 60 && px[2] < 60) ? 0 : -1;
+              }
+
           extern "C" int gles2_init(void)
               {
               if (gUp) return 0;
@@ -3012,22 +3104,28 @@ jobs:
               glEnableVertexAttribArray(2);
               glEnableVertexAttribArray(3);
 
-              // self-test: clear to red, read one pixel back; a pbuffer that does not really render is no use
-              glClearColor(1.f, 0.f, 0.f, 1.f);
-              glClear(GL_COLOR_BUFFER_BIT);
-              unsigned char px[4] = { 0, 0, 0, 0 };
-              glReadPixels(10, 10, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-              if (px[0] < 200 || px[1] > 60 || px[2] > 60 || glGetError() != GL_NO_ERROR)
+              {
+              const char* s;
+              if ((s = (const char*)glGetString(GL_VENDOR)) != 0) { host_log("GLES2: vendor"); host_log(s); }
+              if ((s = (const char*)glGetString(GL_RENDERER)) != 0) { host_log("GLES2: renderer"); host_log(s); }
+              if ((s = (const char*)glGetString(GL_VERSION)) != 0) { host_log("GLES2: version"); host_log(s); }
+              }
+              // pick a render target that really renders: the pbuffer itself, else an FBO (RGBA texture, then RGB565)
+              gMode = -1;
+              for (int m = 0; m < 3 && gMode < 0; ++m)
                   {
-                  host_log("GLES2: self-test failed");
+                  if (gles2_force_mode >= 0 && m != gles2_force_mode) continue;
+                  if (SetupTarget(m) == 0 && SelfTest(m) == 0) gMode = m;
+                  }
+              if (gMode < 0)
+                  {
+                  host_log("GLES2: self-test failed in every mode");
                   gles2_shutdown();
                   return -1;
                   }
+              LogInt("GLES2: using render target mode", gMode, 0, 0, 0);
               ResetState();
               gUp = 1;
-              const char* vr = (const char*)glGetString(GL_RENDERER);
-              host_log("GLES2: renderer");
-              if (vr) host_log(vr);
               return 0;
               }
 
@@ -4196,16 +4294,15 @@ jobs:
             /Volumes/Symbian/gnupoc
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
-      - name: Enable the OpenGL ES 2.0 renderer (when the SDK has it)
-        if: ${{ vars.RE4_NO_GLES2 == '' }}
+      - name: Enable the OpenGL ES 2.0 renderer (required)
         run: |
           set -eo pipefail
           source toolchain/Scripts/env.sh
           ROOT="${EPOCROOT:-/Volumes/Symbian/sdks/symbian3/}"
           has() { find "$ROOT/epoc32" -ipath "$1" 2>/dev/null | grep -q .; }
           if ! { has '*/GLES2/gl2.h' && has '*/EGL/egl.h' && has '*/libglesv2.*' && has '*/libegl.*'; }; then
-            echo "GLES 2 headers / import libraries not found in the SDK: building the software renderer only"
-            exit 0
+            echo "ERROR: GLES 2 headers / import libraries not found in the SDK (this build has no software renderer)"
+            exit 1
           fi
           cat >> symbian/group/re4ds.mmp <<'MMP'
 
