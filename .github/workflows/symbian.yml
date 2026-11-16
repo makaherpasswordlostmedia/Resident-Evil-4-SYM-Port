@@ -2360,6 +2360,45 @@ jobs:
           #endif
           RE4_EOF
           mkdir -p symbian/shim/libc
+          cat > symbian/shim/libc/stdarg.h <<'RE4_EOF'
+          #ifndef SHIM_STDARG_H
+          #define SHIM_STDARG_H
+          typedef __builtin_va_list va_list;
+          #define va_start(v, l) __builtin_va_start(v, l)
+          #define va_end(v) __builtin_va_end(v)
+          #define va_arg(v, t) __builtin_va_arg(v, t)
+          #define va_copy(d, s) __builtin_va_copy(d, s)
+          #endif
+          RE4_EOF
+          mkdir -p symbian/shim/libc
+          cat > symbian/shim/libc/stdbool.h <<'RE4_EOF'
+          #ifndef SHIM_STDBOOL_H
+          #define SHIM_STDBOOL_H
+          #ifndef __cplusplus
+          #define bool _Bool
+          #define true 1
+          #define false 0
+          #endif
+          #define __bool_true_false_are_defined 1
+          #endif
+          RE4_EOF
+          mkdir -p symbian/shim/libc
+          cat > symbian/shim/libc/stddef.h <<'RE4_EOF'
+          #ifndef SHIM_STDDEF_H
+          #define SHIM_STDDEF_H
+          typedef __SIZE_TYPE__ size_t;
+          typedef __PTRDIFF_TYPE__ ptrdiff_t;
+          #ifndef NULL
+          #ifdef __cplusplus
+          #define NULL 0
+          #else
+          #define NULL ((void *)0)
+          #endif
+          #endif
+          #define offsetof(t, m) __builtin_offsetof(t, m)
+          #endif
+          RE4_EOF
+          mkdir -p symbian/shim/libc
           cat > symbian/shim/libc/stdint.h <<'RE4_EOF'
           #ifndef SHIM_STDINT_H
           #define SHIM_STDINT_H
@@ -3019,10 +3058,9 @@ jobs:
             gcc $CF -c "$f" -o "/tmp/hc/$(basename "$f").o"
           done
           # 32-bit, freestanding (-nostdinc + our own libc headers): what the Symbian compiler will see
-          INC=$(gcc -print-file-name=include)
           for f in symbian/build_src/*.c $S/dsshim.c $S/gx.c $S/rt.c symbian/gen/databins.c; do
             gcc -m32 -std=gnu11 -O2 -fsyntax-only -Wno-unused -Wno-misleading-indentation -fno-strict-aliasing \
-                -nostdinc -isystem $S/libc -I$S -Isymbian/gen -Isymbian/build_src -isystem "$INC" "$f"
+                -nostdinc -isystem $S/libc -I$S -Isymbian/gen -Isymbian/build_src "$f"
           done
           echo "32-bit freestanding syntax check OK"
           # whole game links against the shim (main is provided by the stub file)
@@ -3268,7 +3306,11 @@ jobs:
           source toolchain/Scripts/env.sh
           cd symbian/group
           bldmake bldfiles
-          abld build -keepgoing gcce urel
+          abld build -keepgoing gcce urel 2>&1 | tee "$GITHUB_WORKSPACE/build.log" || true
+          echo "=========== compile errors ==========="
+          grep -E "error:|fatal error|undefined reference|\*\*\* \[|cannot find" "$GITHUB_WORKSPACE/build.log" \
+            | sed 's|/Users/runner/work/[^/]*/[^/]*/||g' | sort -u | head -80 || true
+          test -f "${EPOCROOT:-/Volumes/Symbian/sdks/symbian3/}epoc32/release/gcce/urel/re4ds.exe" || { echo "re4ds.exe was not built"; exit 1; }
 
       - name: Package signed SIS
         run: |
