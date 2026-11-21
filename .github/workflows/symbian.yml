@@ -79,26 +79,6 @@ jobs:
 
           If a file is missing the bottom screen lists it.
 
-          ## OpenGL ES 2.0 renderer
-
-          When the Symbian^3 SDK used by the CI has the GLES 2 / EGL headers and import libraries, the build
-          adds `shim/gx_gles2.cpp` (`MACRO RE4_GLES2`, `libEGL.lib`, `libGLESv2.lib`). `gx.c` still does all the DS
-          geometry work (matrices, clipping, polygon RAM limits and counters); the finished polygons are then
-          drawn by the GPU into a 256x192 pbuffer and read back into the 3D layer, so the 2D layer, cut-ins and the
-          front end are unchanged. Perspective-correct textures, texture wrap (in the shader, NPOT-safe), vertex
-          colour, translucency (opaque pass, then translucent in submission order), the DS fog table (uploaded as a
-          256x128 lookup texture), depth write rules and degenerate-polygon lines are all done on the GPU.
-
-          * **GLES 2 only**: with `RE4_GLES2` the software rasterizer is not used at all. If GLES 2 cannot start (no
-            EGL config, shader error, failed self-test) the 3D picture stays blank and `E:\\RE4DS\\re4ds.log` says why
-            (`renderer: GLES 2 FAILED ...`, vendor / renderer / version, self-test pixel values). A lost context is
-            re-created and the textures are uploaded again. The render target is the pbuffer, else an FBO.
-          * The build now fails when the SDK has no GLES 2 headers / import libraries.
-          * Differences from the DS: colours are interpolated perspective-correct (the DS does it in screen space),
-            and "depth equal" polygons are approximated by a 0x200 depth bias + `LEQUAL`.
-          * The DS name clash (`glEnable`, `glFlush`, ...): `shim/nds.h` renames the colliding DS functions to `ds_*`,
-            so the game's own `gl*` calls and the real GLES 2 ones can live in one executable.
-
           ## Controls
 
           On-screen pad (landscape): D-pad, A B X Y, L R, SEL, START. Touching the right-hand (bottom DS) screen
@@ -111,8 +91,7 @@ jobs:
           * Written without access to a Symbian build; the CI is the first real compile of `app/` and the
             Symbian-specific bits. What *is* verified on every run (job `host-test`): the whole game
             compiles and links against the shim, a freestanding 32-bit pass with only our own libc headers,
-            a rasterizer smoke test (perspective texture, translucency, depth), and - with the GLES / EGL dev packages
-            installed on the runner - the GLES 2 back end built and run through Mesa.
+            and a rasterizer smoke test (perspective texture, translucency, depth).
           * Speed is untested on hardware: the 680 MHz ARM11 renders ~2000 polygons in software. If it is too
             slow, lower `POLY_HIGH` / `POLY_LOW` in `ds/source/main.c` (the game already adapts to them).
           * Memory: all `data/*.bin` are read into the game thread's heap (96 MB max).
@@ -1765,9 +1744,6 @@ jobs:
           // a polygon buffer (2048 polygons / 6144 vertices like the hardware) and a scanline rasterizer
           // (perspective-correct textures, vertex colour, alpha, fog, depth buffer). Integer only.
           #include "nds.h"
-          #ifdef RE4_GLES2
-          #include "gx_gles2.h"
-          #endif
 
           IntFn shim_irq_handler(int bit);
           extern volatile int shim_skip_render;
@@ -1787,7 +1763,7 @@ jobs:
           static int fog_on, fog_shift, fog_off;
           static u8 fog_r, fog_g, fog_b, fog_tab[32];
           static u8 fog_lut[0x8000];
-          static int fog_dirty = 1, fog_gl_dirty = 1;
+          static int fog_dirty = 1;
 
           volatile u32 shim_gfx_fifo_reg;
           u32 shim_gfx_control;
@@ -1798,14 +1774,11 @@ jobs:
               u32 *px;            /* ARGB, a = 0..255 */
               u8 *idx;            /* raw texels until the palette arrives */
               u16 w, h;
-              u8 used, type, has_alpha, wrap_s, wrap_t, color0, gl_dirty;
+              u8 used, type, has_alpha, wrap_s, wrap_t, color0;
           } Tex;
           #define MAX_TEX 640
           static Tex tex[MAX_TEX];
           static int bound_tex;
-          #ifdef RE4_GLES2
-          static int gles_on;                  /* 1: polygons are drawn by the GLES 2 back end */
-          #endif
 
           void glGenTextures(int n, int *names)
           {
@@ -1823,9 +1796,6 @@ jobs:
                   int i = names[k];
                   if (i <= 0 || i >= MAX_TEX) continue;
                   free(tex[i].px); free(tex[i].idx);
-          #ifdef RE4_GLES2
-                  if (gles_on) gles2_tex_free(i);
-          #endif
                   memset(&tex[i], 0, sizeof(Tex));
                   if (bound_tex == i) bound_tex = 0;
                   names[k] = 0;
@@ -1851,6 +1821,8 @@ jobs:
               return (a << 24) | ((r << 3 | r >> 2) << 16) | ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
           }
 
+          #define DBG_MAX_LINES 500          /* the log stays short: at most this many diagnostic lines */
+          static int dbg_lines;
           int glTexImageNtr2D(GL_TEXTURE_TYPE_ENUM type, int w, int h, int param, const void *texels, const void *unused)
           {
               (void)unused;
@@ -1878,7 +1850,6 @@ jobs:
                   t->px = (u32 *)malloc(n * 4);
                   if (!t->px) return 0;
                   for (u32 i = 0; i < n; i++) t->px[i] = argb555(s[i], (s[i] & 0x8000) ? 255 : 0);
-                  t->gl_dirty = 1;
                   return 1;
               }
               t->idx = (u8 *)malloc(n);
@@ -1895,6 +1866,12 @@ jobs:
           {
               Tex *t = &tex[bound_tex];
               if (!bound_tex || !t->idx) return 0;
+              if (dbg_lines < DBG_MAX_LINES)
+              {
+                  char m[120];
+                  snprintf(m, sizeof m, "tex %d: type=%d %dx%d pal=%d color0=%d wrap=%d%d alpha=%d", bound_tex, t->type, t->w, t->h, count, t->color0, t->wrap_s, t->wrap_t, t->has_alpha);
+                  host_log(m); dbg_lines++;
+              }
               u32 n = (u32)t->w * t->h;
               u32 lut[256];
               for (int i = 0; i < 256; i++) lut[i] = i < count ? argb555(pal[i], 255) : (count > 0 ? argb555(pal[count - 1], 255) : 0);
@@ -1918,7 +1895,6 @@ jobs:
               }
               free(t->idx);
               t->idx = 0;
-              t->gl_dirty = 1;
               return 1;
           }
 
@@ -2057,6 +2033,13 @@ jobs:
           #define MAX_VERT 6144
           static Poly polys[MAX_POLY];
           static int npoly, nvert;
+          /* diagnostics (logged now and then) and the runtime options file data/gxopt.txt:
+             1 = swap front / back, 2 = no culling at all, 4 = fog off */
+          static int gx_opt;
+          static int dbg_kept, dbg_ktex, dbg_cullb, dbg_cullf, dbg_line, dbg_far, dbg_side, dbg_near, dbg_ovf, dbg_bigcull, dbg_bigkept;
+          /* per-polygon detail of the "floor candidates" (wide, in the lower half of the screen), on a few frames */
+          static int dbg_on = 1, dbg_nc, dbg_nd;
+          static int dbg_pw, dbg_pzf, dbg_pa0, dbg_pfs, dbg_pfn;
 
           typedef struct { int x, y, z, w, u, v; u8 r, g, b; } CV;
 
@@ -2114,7 +2097,7 @@ jobs:
                   if ((dp >= 0) != (dq >= 0))
                       lerp_cv(&a[m++], p, q, (dp << 16) / (dp - dq));
               }
-              if (m < 3) return;
+              if (m < 3) { dbg_near++; return; }
               /* the four sides of the view too, as the hardware does: a big floor / wall polygon would otherwise get
                  screen coordinates far outside the viewport, be clamped and its texture smear into streaks */
               for (int pl = 0; pl < 4; pl++)
@@ -2122,7 +2105,7 @@ jobs:
                   int neg = 0;
                   for (int i = 0; i < m; i++) if (plane_d(&a[i], pl) < 0) neg++;
                   if (neg == 0) continue;
-                  if (neg == m) return;                      /* wholly outside this side: nothing to draw */
+                  if (neg == m) { dbg_side++; return; }       /* wholly outside this side: nothing to draw */
                   int k = 0;
                   for (int i = 0; i < m; i++)
                   {
@@ -2133,12 +2116,12 @@ jobs:
                   }
                   for (int i = 0; i < k; i++) a[i] = b[i];
                   m = k;
-                  if (m < 3) return;
+                  if (m < 3) { dbg_side++; return; }
               }
               int out_far = 0;
               for (int i = 0; i < m; i++) if (a[i].z > a[i].w) out_far++;
-              if (out_far == m) return;
-              if (npoly >= MAX_POLY || nvert + m > MAX_VERT) { shim_gfx_control |= 1 << 13; return; }
+              if (out_far == m) { dbg_far++; return; }
+              if (npoly >= MAX_POLY || nvert + m > MAX_VERT) { dbg_ovf++; shim_gfx_control |= 1 << 13; return; }
 
               Poly *p = &polys[npoly];
               for (int i = 0; i < m; i++) to_screen(&p->v[i], &a[i]);
@@ -2151,16 +2134,45 @@ jobs:
               }
               int cull = (cur_attr >> 6) & 3;
               p->line = 0;
-              if (area == 0) p->line = 1;
+              int wide = 0, floorish = 0;
+              {
+                  int mn = p->v[0].sx, mx = mn, sysum = 0;
+                  for (int i = 0; i < m; i++)
+                  {
+                      if (p->v[i].sx < mn) mn = p->v[i].sx;
+                      if (p->v[i].sx > mx) mx = p->v[i].sx;
+                      sysum += p->v[i].sy;
+                  }
+                  wide = mx - mn > 1600;                      /* wider than ~100 pixels: a floor or a wall */
+                  floorish = wide && sysum / m > 96 * 16;     /* ...in the lower half of the screen: the ground */
+              }
+              p->pad = (u8)floorish;
+              if (area == 0) { p->line = 1; dbg_line++; }
               else
               {
                   int front = area > 0;
-                  if (cull == 0 || (cull == 1 && front) || (cull == 2 && !front)) return;
+                  if (gx_opt & 1) front = !front;
+                  if (!(gx_opt & 2) && (cull == 0 || (cull == 1 && front) || (cull == 2 && !front)))
+                  {
+                      if (cull == 0) dbg_cullb++; else if (cull == 1) dbg_cullf++; else dbg_cullb++;
+                      if (wide) dbg_bigcull++;
+                      if (dbg_on && floorish && dbg_nc < 6 && dbg_lines < DBG_MAX_LINES)
+                      {
+                          char lm[200];
+                          snprintf(lm, sizeof lm, "floor CULLED: cullmode=%d front=%d area=%d n=%d tex=%d x=%d..%d y=%d..%d z0=%d", cull, front, (int)(area >> 8), m,
+                                   bound_tex, p->v[0].sx >> 4, p->v[m / 2].sx >> 4, p->v[0].sy >> 4, p->v[m / 2].sy >> 4, p->v[0].z);
+                          host_log(lm); dbg_nc++; dbg_lines++;
+                      }
+                      return;
+                  }
               }
+              dbg_kept++;
+              if (wide) dbg_bigkept++;
               p->attr = cur_attr;
               p->tex = tex[bound_tex].used && tex[bound_tex].px ? bound_tex : 0;
               int alpha = (cur_attr >> 16) & 31;
               p->trans = (alpha < 31 || (p->tex && tex[p->tex].has_alpha)) ? 1 : 0;
+              if (p->tex) dbg_ktex++;
               npoly++;
               nvert += m;
           }
@@ -2234,7 +2246,6 @@ jobs:
                   fog_lut[z] = (u8)d;
               }
               fog_dirty = 0;
-              fog_gl_dirty = 1;
           }
 
           static void raster_tri(const Poly *p, const SV *a, const SV *b, const SV *c)
@@ -2295,7 +2306,7 @@ jobs:
 
               const u32 attr = p->attr;
               const int alpha = (attr >> 16) & 31;
-              const int fog = fog_on && (attr & POLY_FOG);
+              const int fog = fog_on && !(gx_opt & 4) && (attr & POLY_FOG);
               const int wdepth = !p->trans || (attr & POLY_NEW_DEPTH);
               const int eqtest = (attr & POLY_DEPTHTEST_EQUAL) != 0;
               const int tw = tx ? tx->w : 0, th = tx ? tx->h : 0;
@@ -2304,6 +2315,7 @@ jobs:
               const u32 fogc = (fog_r << 3 | fog_r >> 2) << 16 | (fog_g << 3 | fog_g >> 2) << 8 | (fog_b << 3 | fog_b >> 2);
 
               const int S = shim_lowres ? 2 : 1;
+              const int dbg = dbg_on && p->pad;
               if (S == 2) row0 += row0 & 1;
               for (int row = row0; row < row1; row += S)
               {
@@ -2357,6 +2369,7 @@ jobs:
                       if (zi < 0) zi = 0; if (zi > 0x7FFF) zi = 0x7FFF;
                       if (eqtest ? (zi - zb[x] > 0x200 || zb[x] - zi > 0x200) : (zi >= zb[x]))
                       {
+                          if (dbg) dbg_pzf++;
                           if (textured) { u += du; v += dv; span -= S; }
                           continue;
                       }
@@ -2376,7 +2389,7 @@ jobs:
                           u32 tc = tx->px[vi * tw + ui];
                           u += du; v += dv; span -= S;
                           u32 ta = tc >> 24;
-                          if (ta == 0) continue;
+                          if (ta == 0) { if (dbg) dbg_pa0++; continue; }
                           pr = (((tc >> 16) & 255) * (cr5 + 1)) >> 5;
                           pg = (((tc >> 8) & 255) * (cg5 + 1)) >> 5;
                           pb = ((tc & 255) * (cb5 + 1)) >> 5;
@@ -2390,6 +2403,7 @@ jobs:
                       if (fog)
                       {
                           int d = fog_lut[zi];
+                          if (dbg) { dbg_pfs += d; dbg_pfn++; }
                           pr += (int)(((int)((fogc >> 16) & 255) - (int)pr) * d) >> 7;
                           pg += (int)(((int)((fogc >> 8) & 255) - (int)pg) * d) >> 7;
                           pb += (int)(((int)(fogc & 255) - (int)pb) * d) >> 7;
@@ -2403,6 +2417,7 @@ jobs:
                           pb = (pb * a5 + db_ * (31 - a5)) * 33 >> 10;
                       }
                       fb[x] = (pr & 255) << 16 | (pg & 255) << 8 | (pb & 255);
+                      if (dbg) dbg_pw++;
                       if (wdepth) zb[x] = (u16)zi;
                       if (S == 2)
                       {
@@ -2454,158 +2469,66 @@ jobs:
                       const Poly *p = &polys[i];
                       if (p->trans != pass) continue;
                       if (p->line) { if (!p->tex) raster_line(p); continue; }   /* (a textured sliver would be a white line) */
+                      const int dbg = dbg_on && p->pad && dbg_nd < 8 && dbg_lines < DBG_MAX_LINES;
+                      if (dbg) { dbg_pw = dbg_pzf = dbg_pa0 = dbg_pfs = dbg_pfn = 0; }
                       for (int k = 1; k + 1 < p->n; k++) raster_tri(p, &p->v[0], &p->v[k], &p->v[k + 1]);
+                      if (dbg)
+                      {
+                          char lm[260];
+                          const Tex *tt = p->tex ? &tex[p->tex] : 0;
+                          snprintf(lm, sizeof lm, "floor DRAWN: n=%d tex=%d(%dx%d t%d px0=%08x) cullmode=%d alpha=%d trans=%d fogpoly=%d y=%d..%d z=%d..%d wrote=%d zfail=%d alpha0=%d fogavg=%d",
+                                   p->n, p->tex, tt ? tt->w : 0, tt ? tt->h : 0, tt ? tt->type : 0, (tt && tt->px) ? (unsigned)tt->px[0] : 0u,
+                                   (int)((p->attr >> 6) & 3), (int)((p->attr >> 16) & 31), p->trans, (p->attr & POLY_FOG) != 0,
+                                   p->v[0].sy >> 4, p->v[p->n / 2].sy >> 4, p->v[0].z, p->v[p->n / 2].z,
+                                   dbg_pw, dbg_pzf, dbg_pa0, dbg_pfn ? dbg_pfs / dbg_pfn : -1);
+                          host_log(lm); dbg_nd++; dbg_lines++;
+                      }
                   }
           }
-
-
-          #ifdef RE4_GLES2
-          /* ------------------------------------------------ OpenGL ES 2.0 back end */
-          static GlesVert gverts[MAX_VERT];
-          static u16 gidx[MAX_VERT * 3];
-          #define X8(c) ((u32)((c) << 3 | (c) >> 2))
-
-          static void gles_start(void)
-          {
-              if (gles2_init() == 0) { gles_on = 1; host_log("renderer: OpenGL ES 2.0"); }
-              else host_log("renderer: GLES 2 FAILED, no software fallback in this build: no 3D picture");
-          }
-
-          static void gles_flush_batch(int line, int t, int wd, int eq, int blend, int cnt)
-          {
-              if (cnt <= 0) return;
-              if (t > 0 && tex[t].gl_dirty && tex[t].px)
-              {
-                  gles2_tex_set(t, tex[t].w, tex[t].h, tex[t].wrap_s, tex[t].wrap_t, (const unsigned int *)tex[t].px);
-                  tex[t].gl_dirty = 0;
-              }
-              gles2_draw(line, t, wd, eq, blend, gidx, cnt);
-          }
-
-          static int render_gles(void)
-          {
-              if (fog_dirty) rebuild_fog();
-              gles2_frame_begin((int)X8(clr_r), (int)X8(clr_g), (int)X8(clr_b), clr_depth,
-                                (int)X8(fog_r), (int)X8(fog_g), (int)X8(fog_b), fog_gl_dirty ? fog_lut : 0);
-              fog_gl_dirty = 0;
-
-              static int base[MAX_POLY];
-              int gn = 0;
-              for (int i = 0; i < npoly; i++)
-              {
-                  const Poly *p = &polys[i];
-                  const int textured = p->tex != 0;
-                  const int a5 = (p->attr >> 16) & 31;
-                  const int fog = fog_on && (p->attr & POLY_FOG);
-                  base[i] = gn;
-                  for (int k = 0; k < p->n; k++)
-                  {
-                      const SV *s = &p->v[k];
-                      GlesVert *o = &gverts[gn++];
-                      o->sx = (float)s->sx; o->sy = (float)s->sy; o->z = (float)s->z; o->iw = (float)s->iw;
-                      o->u = (float)s->u; o->v = (float)s->v;
-                      if (textured)      /* the DS modulates a texel by (c + 1) / 32 */
-                      {
-                          o->col[0] = (u8)(((s->r + 1) * 255) >> 5);
-                          o->col[1] = (u8)(((s->g + 1) * 255) >> 5);
-                          o->col[2] = (u8)(((s->b + 1) * 255) >> 5);
-                      }
-                      else { o->col[0] = (u8)X8(s->r); o->col[1] = (u8)X8(s->g); o->col[2] = (u8)X8(s->b); }
-                      o->col[3] = (u8)X8(a5);
-                      o->misc[0] = fog ? 255 : 0; o->misc[1] = o->misc[2] = o->misc[3] = 0;
-                  }
-              }
-              gles2_vertices(gverts, gn);
-
-              for (int pass = 0; pass < 2; pass++)
-              {
-                  int cnt = 0, ct = -1, cw = 0, ce = 0, cl = 0;
-                  for (int i = 0; i < npoly; i++)
-                  {
-                      const Poly *p = &polys[i];
-                      if (p->trans != pass) continue;
-                      if (p->line && p->tex) continue;
-                      const int line = p->line ? 1 : 0, t = line ? 0 : p->tex;
-                      const int wd = !p->trans || (p->attr & POLY_NEW_DEPTH) ? 1 : 0;
-                      const int eq = (p->attr & POLY_DEPTHTEST_EQUAL) ? 1 : 0;
-                      if (cnt && (t != ct || wd != cw || eq != ce || line != cl))
-                      {
-                          gles_flush_batch(cl, ct, cw, ce, pass, cnt);
-                          cnt = 0;
-                      }
-                      ct = t; cw = wd; ce = eq; cl = line;
-                      if (line)
-                      {
-                          int bi = 0, bj = 0;
-                          s64 best = -1;
-                          for (int a = 0; a < p->n; a++)
-                              for (int b = a + 1; b < p->n; b++)
-                              {
-                                  s64 dx = p->v[a].sx - p->v[b].sx, dy = p->v[a].sy - p->v[b].sy, d = dx * dx + dy * dy;
-                                  if (d > best) { best = d; bi = a; bj = b; }
-                              }
-                          gidx[cnt++] = (u16)(base[i] + bi);
-                          gidx[cnt++] = (u16)(base[i] + bj);
-                      }
-                      else
-                          for (int k = 1; k + 1 < p->n; k++)
-                          {
-                              gidx[cnt++] = (u16)base[i];
-                              gidx[cnt++] = (u16)(base[i] + k);
-                              gidx[cnt++] = (u16)(base[i] + k + 1);
-                          }
-                  }
-                  gles_flush_batch(cl, ct, cw, ce, pass, cnt);
-              }
-              return gles2_frame_end((unsigned int *)shim_fb3d);   /* (u32 is unsigned long on Symbian, same size) */
-          }
-          #endif
 
           void glFlush(u32 flags)
           {
               (void)flags;
               shim_dma_run();
-              static int first = 1;
+              static int first = 1, nflush;
               if (first)
               {
                   char m[64];
                   snprintf(m, sizeof m, "first glFlush: %d polys", npoly);
                   host_log(m);
                   first = 0;
+                  FILE *of = fopen("data/gxopt.txt", "rb");
+                  if (of)
+                  {
+                      char ob[16] = { 0 };
+                      size_t on = fread(ob, 1, 15, of);
+                      fclose(of);
+                      for (size_t i = 0; i < on && ob[i] >= '0' && ob[i] <= '9'; i++) gx_opt = gx_opt * 10 + (ob[i] - '0');
+                      snprintf(m, sizeof m, "gxopt: %d", gx_opt);
+                      host_log(m);
+                  }
               }
-              if (!shim_skip_render)
+              nflush++;
+              if (dbg_on && dbg_lines < DBG_MAX_LINES)
+              {
+                  char m[200];
+                  snprintf(m, sizeof m, "gx: kept=%d tex=%d cullB=%d cullF=%d line=%d far=%d side=%d near=%d ovf=%d bigcull=%d bigkept=%d fog=%d/%d/%d",
+                           dbg_kept, dbg_ktex, dbg_cullb, dbg_cullf, dbg_line, dbg_far, dbg_side, dbg_near, dbg_ovf, dbg_bigcull, dbg_bigkept, fog_on, fog_off, fog_shift);
+                  host_log(m);
+              }
+              dbg_lines++;
+              dbg_kept = dbg_ktex = dbg_cullb = dbg_cullf = dbg_line = dbg_far = dbg_side = dbg_near = dbg_ovf = dbg_bigcull = dbg_bigkept = 0;
+              dbg_nc = dbg_nd = 0;
+              const int dbg_frame = dbg_on;
+              if (!shim_skip_render || dbg_frame)
               {
                   u32 t0 = host_ticks_ms();
-                  int done = 0;
-          #ifdef RE4_GLES2
-                  /* GLES 2 only: the software rasterizer is not used in this build */
-                  done = 1;
-                  if (gles_on && render_gles())
-                  {
-                      host_log("GLES 2 context lost: re-creating");
-                      gles2_shutdown();
-                      gles_on = 0;
-                      if (gles2_init() == 0)
-                      {
-                          gles_on = 1;
-                          for (int i = 0; i < MAX_TEX; i++) tex[i].gl_dirty = tex[i].px ? 1 : 0;
-                          fog_gl_dirty = 1;
-                      }
-                  }
-                  if (!gles_on)
-                  {
-                      u32 clear = (u32)(X8(clr_r) << 16 | X8(clr_g) << 8 | X8(clr_b));
-                      for (int i = 0; i < 256 * 192; i++) shim_fb3d[i] = clear;
-                  }
-          #else
                   render_all();
-          #endif
                   u32 t1 = host_ticks_ms();
                   shim_last_render = t1;
                   u32 dt = t1 - t0;
                   /* a slow pass: draw in 2x2 blocks until it is cheap enough to go back to full resolution */
-                  if (done) shim_lowres = 0;
-                  else if (shim_lowres) { if (dt < 14) shim_lowres = 0; }
+                  if (shim_lowres) { if (dt < 14) shim_lowres = 0; }
                   else if (dt > 55) shim_lowres = 1;
               }
               npoly = nvert = 0;
@@ -2616,11 +2539,6 @@ jobs:
           {
               mat_ident(&cur_pos); mat_ident(&cur_proj); mat_ident(&mvp);
               sp = 0; mvp_dirty = 1; npoly = nvert = 0;
-          #ifdef RE4_GLES2
-              static int tried;
-              if (!tried) { tried = 1; gles_start(); }
-              else if (gles_on) gles2_tex_free(-1);
-          #endif
               memset(tex, 0, sizeof tex);
           }
           void glEnable(int bits) { if (bits & GL_FOG) fog_on = 1; }
@@ -2755,514 +2673,6 @@ jobs:
           }
 
           int dmaBusy(int ch) { (void)ch; shim_dma_run(); return 0; }
-          RE4_EOF
-
-          cat > symbian/shim/gx_gles2.h <<'RE4_EOF'
-          // gx_gles2.h - interface between the software DS layer (gx.c) and the OpenGL ES 2.0 renderer
-          // (gx_gles2.cpp). Plain C types only: gx.c cannot include the GL headers (the DS gl* names clash).
-          #ifndef GX_GLES2_H
-          #define GX_GLES2_H
-          #ifdef __cplusplus
-          extern "C" {
-          #endif
-
-          /* one polygon corner as gx.c produced it: screen position in 1/16 pixel (sx 0..4096, sy 0..3072),
-             z 0..0x7FFF, iw = 2^34 / w, u/v in 12.4 fixed texels; colours already expanded to 0..255 */
-          typedef struct
-              {
-              float sx, sy, z, iw, u, v;
-              unsigned char col[4];       /* r, g, b, polygon alpha */
-              unsigned char misc[4];      /* [0] = fog on */
-              } GlesVert;
-
-          int  gles2_init(void);                                   /* 0 = ok; anything else: stay on the software path */
-          void gles2_shutdown(void);
-          void gles2_frame_begin(int aClrR, int aClrG, int aClrB, int aClrDepth,
-                                 int aFogR, int aFogG, int aFogB, const unsigned char* aFogLut /* 32768 bytes, or 0 = unchanged */);
-          void gles2_vertices(const GlesVert* aVerts, int aCount);
-          int  gles2_tex_set(int aId, int aW, int aH, int aWrapS, int aWrapT, const unsigned int* aArgb);
-          void gles2_tex_free(int aId);                            /* aId < 0: all */
-          void gles2_draw(int aLines, int aTex, int aDepthWrite, int aDepthEq, int aBlend,
-                          const unsigned short* aIdx, int aCount);
-          int  gles2_frame_end(unsigned int* aFb256x192);          /* 0 = ok, 1 = context lost */
-
-          #ifdef __cplusplus
-          }
-          #endif
-          #endif
-          RE4_EOF
-
-          cat > symbian/shim/gx_gles2.cpp <<'RE4_EOF'
-          // gx_gles2.cpp - OpenGL ES 2.0 back end of the DS 3D layer. gx.c still does the DS geometry work
-          // (matrices, clipping, polygon RAM limits); this draws the finished polygons on the GPU into a
-          // 256x192 pbuffer and reads the frame back into the 3D layer, so the 2D / sub screen code, the
-          // cut-ins and the front end stay exactly as they were. Compiled only with -DRE4_GLES2; any failure
-          // (no EGL config, no pbuffer, shader error, context loss) returns control to the software rasterizer.
-          #ifdef RE4_GLES2
-
-          #include <EGL/egl.h>
-          #include <GLES2/gl2.h>
-          #include "gx_gles2.h"
-
-          extern "C" void host_log(const char* aMsg);
-
-          #define W3D 256
-          #define H3D 192
-          #define MAXTEX 640
-
-          static EGLDisplay gDpy = EGL_NO_DISPLAY;
-          static EGLContext gCtx = EGL_NO_CONTEXT;
-          static EGLSurface gSurf = EGL_NO_SURFACE;
-          static int gUp = 0;
-
-          static GLuint gProg, gFogTex;
-          static GLint gUTex, gUFog, gUInfo, gUTextured, gUFogCol, gUBias;
-          static GLuint gTex[MAXTEX];
-          static unsigned short gTw[MAXTEX], gTh[MAXTEX];
-          static unsigned char gWs[MAXTEX], gWt[MAXTEX];
-          static unsigned char gPix[W3D * H3D * 4];
-
-          // cached state
-          static int gDepthWrite, gBlend, gEq, gCurTex, gTexturedState;
-
-          static const char kVert[] =
-              "attribute vec4 aP;\n"
-              "attribute vec2 aUV;\n"
-              "attribute vec4 aCol;\n"
-              "attribute vec4 aMisc;\n"
-              "uniform float uBias;\n"
-              "varying vec2 vUV;\n"
-              "varying vec4 vCol;\n"
-              "varying float vFog;\n"
-              "void main() {\n"
-              "  float w = 4194304.0 / max(aP.w, 1.0);\n"                    // w / 4096 (iw = 2^34 / w)
-              "  float x = aP.x * (1.0 / 2048.0) - 1.0;\n"
-              "  float y = aP.y * (1.0 / 1536.0) - 1.0;\n"                  // top row = GL row 0: no flip on read-back
-              "  float z = aP.z * (2.0 / 32767.0) - 1.0 - uBias;\n"
-              "  gl_Position = vec4(x * w, y * w, z * w, w);\n"
-              "  vUV = aUV * (1.0 / 16.0);\n"
-              "  vCol = aCol;\n"
-              "  vFog = aMisc.x;\n"
-              "}\n";
-
-          static const char kFrag[] =
-              "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
-              "precision highp float;\n"
-              "#else\n"
-              "precision mediump float;\n"
-              "#endif\n"
-              "uniform sampler2D uTex;\n"
-              "uniform sampler2D uFog;\n"
-              "uniform vec4 uInfo;\n"                                        // 1/w, 1/h, wrap s, wrap t
-              "uniform float uTextured;\n"
-              "uniform vec4 uFogCol;\n"
-              "varying vec2 vUV;\n"
-              "varying vec4 vCol;\n"
-              "varying float vFog;\n"
-              "void main() {\n"
-              "  vec3 c = vCol.rgb;\n"
-              "  float a = vCol.a;\n"
-              "  if (uTextured > 0.5) {\n"
-              "    vec2 t = vUV * uInfo.xy;\n"
-              "    if (uInfo.z > 0.5) t.x = fract(t.x);\n"
-              "    if (uInfo.w > 0.5) t.y = fract(t.y);\n"
-              "    vec4 tc = texture2D(uTex, t);\n"
-              "    if (tc.a < 0.002) discard;\n"
-              "    c = tc.rgb * c;\n"
-              "    if (tc.a < 0.97) a = tc.a * a;\n"
-              "  }\n"
-              "  if (a < 0.002) discard;\n"
-              "  if (vFog > 0.5) {\n"
-              "    float zi = floor(gl_FragCoord.z * 32767.0 + 0.5);\n"
-              "    float fy = floor(zi / 256.0);\n"
-              "    float fx = zi - fy * 256.0;\n"
-              "    float d = texture2D(uFog, (vec2(fx, fy) + 0.5) * vec2(1.0 / 256.0, 1.0 / 128.0)).r * (255.0 / 128.0);\n"
-              "    c = mix(c, uFogCol.rgb, d);\n"
-              "  }\n"
-              "  gl_FragColor = vec4(c, a);\n"
-              "}\n";
-
-          static GLuint Compile(GLenum aType, const char* aSrc)
-              {
-              GLuint s = glCreateShader(aType);
-              glShaderSource(s, 1, &aSrc, 0);
-              glCompileShader(s);
-              GLint ok = 0;
-              glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-              if (!ok)
-                  {
-                  char log[200];
-                  GLsizei n = 0;
-                  glGetShaderInfoLog(s, sizeof log - 1, &n, log);
-                  log[n < 0 ? 0 : n] = 0;
-                  host_log("GLES2: shader error:");
-                  host_log(log);
-                  glDeleteShader(s);
-                  return 0;
-                  }
-              return s;
-              }
-
-          static int BuildProgram()
-              {
-              GLuint v = Compile(GL_VERTEX_SHADER, kVert);
-              GLuint f = Compile(GL_FRAGMENT_SHADER, kFrag);
-              if (!v || !f) return -1;
-              gProg = glCreateProgram();
-              glAttachShader(gProg, v);
-              glAttachShader(gProg, f);
-              glBindAttribLocation(gProg, 0, "aP");
-              glBindAttribLocation(gProg, 1, "aUV");
-              glBindAttribLocation(gProg, 2, "aCol");
-              glBindAttribLocation(gProg, 3, "aMisc");
-              glLinkProgram(gProg);
-              GLint ok = 0;
-              glGetProgramiv(gProg, GL_LINK_STATUS, &ok);
-              if (!ok)
-                  {
-                  host_log("GLES2: program link failed");
-                  return -1;
-                  }
-              glUseProgram(gProg);
-              gUTex = glGetUniformLocation(gProg, "uTex");
-              gUFog = glGetUniformLocation(gProg, "uFog");
-              gUInfo = glGetUniformLocation(gProg, "uInfo");
-              gUTextured = glGetUniformLocation(gProg, "uTextured");
-              gUFogCol = glGetUniformLocation(gProg, "uFogCol");
-              gUBias = glGetUniformLocation(gProg, "uBias");
-              glUniform1i(gUTex, 0);
-              glUniform1i(gUFog, 1);
-              return 0;
-              }
-
-          static int ChooseAndCreate(int aRgb8)
-              {
-              EGLint attrs[] =
-                  {
-                  EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-                  EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-                  EGL_RED_SIZE, aRgb8 ? 8 : 5,
-                  EGL_GREEN_SIZE, aRgb8 ? 8 : 6,
-                  EGL_BLUE_SIZE, aRgb8 ? 8 : 5,
-                  EGL_DEPTH_SIZE, 16,
-                  EGL_NONE
-                  };
-              EGLConfig cfg[16];
-              EGLint n = 0;
-              if (!eglChooseConfig(gDpy, attrs, cfg, 16, &n) || n < 1) return -1;
-              EGLint pb[] = { EGL_WIDTH, W3D, EGL_HEIGHT, H3D, EGL_NONE };
-              EGLint cx[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-              for (EGLint i = 0; i < n; ++i)
-                  {
-                  gSurf = eglCreatePbufferSurface(gDpy, cfg[i], pb);
-                  if (gSurf == EGL_NO_SURFACE) continue;
-                  gCtx = eglCreateContext(gDpy, cfg[i], EGL_NO_CONTEXT, cx);
-                  if (gCtx == EGL_NO_CONTEXT)
-                      {
-                      eglDestroySurface(gDpy, gSurf);
-                      gSurf = EGL_NO_SURFACE;
-                      continue;
-                      }
-                  if (eglMakeCurrent(gDpy, gSurf, gSurf, gCtx)) return 0;
-                  eglDestroyContext(gDpy, gCtx);
-                  eglDestroySurface(gDpy, gSurf);
-                  gCtx = EGL_NO_CONTEXT;
-                  gSurf = EGL_NO_SURFACE;
-                  }
-              return -1;
-              }
-
-          static void ResetState()
-              {
-              gDepthWrite = gBlend = gEq = -1;
-              gCurTex = -1;
-              gTexturedState = -1;
-              }
-
-
-          // ---- render target: 0 = the pbuffer itself, 1 = FBO + RGBA texture, 2 = FBO + RGB565 renderbuffer
-          extern "C" { int gles2_force_mode = -1; }      // test hook: >= 0 tries only that mode
-          static int gMode = 0;
-          static GLuint gFbo, gColTex, gColRb, gDepthRb;
-
-          static void LogInt(const char* aTag, int a, int b, int c, int d)
-              {
-              char s[96];
-              int n = 0;
-              for (const char* t = aTag; *t && n < 40; ++t) s[n++] = *t;
-              int v[4] = { a, b, c, d };
-              for (int k = 0; k < 4; ++k)
-                  {
-                  s[n++] = ' ';
-                  int x = v[k];
-                  if (x < 0) { s[n++] = '-'; x = -x; }
-                  char r[12];
-                  int m = 0;
-                  do { r[m++] = (char)('0' + x % 10); x /= 10; } while (x && m < 11);
-                  while (m) s[n++] = r[--m];
-                  }
-              s[n] = 0;
-              host_log(s);
-              }
-
-          static int SetupTarget(int aMode)
-              {
-              while (glGetError() != GL_NO_ERROR) {}
-              if (aMode == 0)
-                  {
-                  glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                  return 0;
-                  }
-              if (!gFbo) glGenFramebuffers(1, &gFbo);
-              if (!gDepthRb) glGenRenderbuffers(1, &gDepthRb);
-              glBindFramebuffer(GL_FRAMEBUFFER, gFbo);
-              glBindRenderbuffer(GL_RENDERBUFFER, gDepthRb);
-              glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, W3D, H3D);
-              glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, gDepthRb);
-              if (aMode == 1)
-                  {
-                  if (!gColTex) glGenTextures(1, &gColTex);
-                  glActiveTexture(GL_TEXTURE0);
-                  glBindTexture(GL_TEXTURE_2D, gColTex);
-                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, W3D, H3D, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
-                  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, gColTex, 0);
-                  glBindTexture(GL_TEXTURE_2D, 0);
-                  }
-              else
-                  {
-                  if (!gColRb) glGenRenderbuffers(1, &gColRb);
-                  glBindRenderbuffer(GL_RENDERBUFFER, gColRb);
-                  glRenderbufferStorage(GL_RENDERBUFFER, GL_RGB565, W3D, H3D);
-                  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, gColRb);
-                  }
-              GLenum st = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-              if (st != GL_FRAMEBUFFER_COMPLETE)
-                  {
-                  LogInt("GLES2: fbo incomplete, status", (int)st, aMode, 0, 0);
-                  glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                  return -1;
-                  }
-              return 0;
-              }
-
-          // clear to red and a second colour, read two pixels back
-          static int SelfTest(int aMode)
-              {
-              glViewport(0, 0, W3D, H3D);
-              glDepthMask(GL_TRUE);
-              glDisable(GL_BLEND);
-              glClearColor(1.f, 0.f, 0.f, 1.f);
-              glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-              unsigned char px[4] = { 9, 9, 9, 9 };
-              glReadPixels(10, 10, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-              GLenum err = glGetError();
-              LogInt("GLES2: self-test mode/r/g/b", aMode, px[0], px[1], px[2]);
-              LogInt("GLES2: self-test glerr/egl", (int)err, (int)eglGetError(), 0, 0);
-              return (px[0] > 200 && px[1] < 60 && px[2] < 60) ? 0 : -1;
-              }
-
-          extern "C" int gles2_init(void)
-              {
-              if (gUp) return 0;
-              gDpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-              if (gDpy == EGL_NO_DISPLAY) { host_log("GLES2: no EGL display"); return -1; }
-              EGLint maj = 0, min = 0;
-              if (!eglInitialize(gDpy, &maj, &min)) { host_log("GLES2: eglInitialize failed"); return -1; }
-              if (!eglBindAPI(EGL_OPENGL_ES_API)) { host_log("GLES2: eglBindAPI failed"); return -1; }
-              if (ChooseAndCreate(1) != 0 && ChooseAndCreate(0) != 0)
-                  {
-                  host_log("GLES2: no pbuffer config / context");
-                  eglTerminate(gDpy);
-                  gDpy = EGL_NO_DISPLAY;
-                  return -1;
-                  }
-              if (BuildProgram() != 0) { gles2_shutdown(); return -1; }
-
-              for (int i = 0; i < MAXTEX; ++i) gTex[i] = 0;
-              glGenTextures(1, &gFogTex);
-              glActiveTexture(GL_TEXTURE1);
-              glBindTexture(GL_TEXTURE_2D, gFogTex);
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-              glActiveTexture(GL_TEXTURE0);
-
-              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-              glPixelStorei(GL_PACK_ALIGNMENT, 4);
-              glViewport(0, 0, W3D, H3D);
-              glDisable(GL_CULL_FACE);
-              glDisable(GL_DITHER);
-              glEnable(GL_DEPTH_TEST);
-              glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-              glEnableVertexAttribArray(0);
-              glEnableVertexAttribArray(1);
-              glEnableVertexAttribArray(2);
-              glEnableVertexAttribArray(3);
-
-              {
-              const char* s;
-              if ((s = (const char*)glGetString(GL_VENDOR)) != 0) { host_log("GLES2: vendor"); host_log(s); }
-              if ((s = (const char*)glGetString(GL_RENDERER)) != 0) { host_log("GLES2: renderer"); host_log(s); }
-              if ((s = (const char*)glGetString(GL_VERSION)) != 0) { host_log("GLES2: version"); host_log(s); }
-              }
-              // pick a render target that really renders: the pbuffer itself, else an FBO (RGBA texture, then RGB565)
-              gMode = -1;
-              for (int m = 0; m < 3 && gMode < 0; ++m)
-                  {
-                  if (gles2_force_mode >= 0 && m != gles2_force_mode) continue;
-                  if (SetupTarget(m) == 0 && SelfTest(m) == 0) gMode = m;
-                  }
-              if (gMode < 0)
-                  {
-                  host_log("GLES2: self-test failed in every mode");
-                  gles2_shutdown();
-                  return -1;
-                  }
-              LogInt("GLES2: using render target mode", gMode, 0, 0, 0);
-              ResetState();
-              gUp = 1;
-              return 0;
-              }
-
-          extern "C" void gles2_shutdown(void)
-              {
-              if (gDpy != EGL_NO_DISPLAY)
-                  {
-                  eglMakeCurrent(gDpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-                  if (gCtx != EGL_NO_CONTEXT) eglDestroyContext(gDpy, gCtx);
-                  if (gSurf != EGL_NO_SURFACE) eglDestroySurface(gDpy, gSurf);
-                  eglTerminate(gDpy);
-                  }
-              gDpy = EGL_NO_DISPLAY;
-              gCtx = EGL_NO_CONTEXT;
-              gSurf = EGL_NO_SURFACE;
-              gUp = 0;
-              }
-
-          extern "C" void gles2_frame_begin(int aClrR, int aClrG, int aClrB, int aClrDepth,
-                                            int aFogR, int aFogG, int aFogB, const unsigned char* aFogLut)
-              {
-              if (aFogLut)
-                  {
-                  glActiveTexture(GL_TEXTURE1);
-                  glBindTexture(GL_TEXTURE_2D, gFogTex);
-                  glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 256, 128, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, aFogLut);
-                  glActiveTexture(GL_TEXTURE0);
-                  }
-              glUniform4f(gUFogCol, aFogR / 255.f, aFogG / 255.f, aFogB / 255.f, 1.f);
-              glDepthMask(GL_TRUE);
-              glDisable(GL_BLEND);
-              glDepthFunc(GL_LESS);
-              glUniform1f(gUBias, 0.f);
-              glClearColor(aClrR / 255.f, aClrG / 255.f, aClrB / 255.f, 1.f);
-              glClearDepthf(aClrDepth / 32767.f);
-              glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-              ResetState();
-              gDepthWrite = 1;
-              gBlend = 0;
-              gEq = 0;
-              }
-
-          extern "C" void gles2_vertices(const GlesVert* aVerts, int aCount)
-              {
-              (void)aCount;
-              const GLsizei stride = (GLsizei)sizeof(GlesVert);
-              const char* b = (const char*)aVerts;
-              glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, stride, b);
-              glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, b + 16);
-              glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, b + 24);
-              glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride, b + 28);
-              }
-
-          extern "C" int gles2_tex_set(int aId, int aW, int aH, int aWrapS, int aWrapT, const unsigned int* aArgb)
-              {
-              if (aId <= 0 || aId >= MAXTEX || aW <= 0 || aH <= 0 || !aArgb) return -1;
-              unsigned char* rgba = new unsigned char[(unsigned)aW * aH * 4];
-              if (!rgba) return -1;
-              for (int i = 0, n = aW * aH; i < n; ++i)
-                  {
-                  unsigned int p = aArgb[i];
-                  rgba[i * 4 + 0] = (unsigned char)(p >> 16);
-                  rgba[i * 4 + 1] = (unsigned char)(p >> 8);
-                  rgba[i * 4 + 2] = (unsigned char)p;
-                  rgba[i * 4 + 3] = (unsigned char)(p >> 24);
-                  }
-              if (!gTex[aId]) glGenTextures(1, &gTex[aId]);
-              glActiveTexture(GL_TEXTURE0);
-              glBindTexture(GL_TEXTURE_2D, gTex[aId]);
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);   // repeat is done in the shader (NPOT-safe)
-              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, aW, aH, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-              delete[] rgba;
-              gCurTex = -1;
-              gTw[aId] = (unsigned short)aW;
-              gTh[aId] = (unsigned short)aH;
-              gWs[aId] = (unsigned char)(aWrapS != 0);
-              gWt[aId] = (unsigned char)(aWrapT != 0);
-              return glGetError() == GL_NO_ERROR ? 0 : -1;
-              }
-
-          extern "C" void gles2_tex_free(int aId)
-              {
-              if (!gUp) return;
-              for (int i = (aId < 0 ? 1 : aId); i < MAXTEX && (aId < 0 || i == aId); ++i)
-                  {
-                  if (gTex[i]) { glDeleteTextures(1, &gTex[i]); gTex[i] = 0; }
-                  }
-              gCurTex = -1;
-              }
-
-          extern "C" void gles2_draw(int aLines, int aTex, int aDepthWrite, int aDepthEq, int aBlend,
-                                     const unsigned short* aIdx, int aCount)
-              {
-              if (aCount <= 0) return;
-              int tex = (aTex > 0 && aTex < MAXTEX && gTex[aTex]) ? aTex : 0;
-              if (tex != gCurTex)
-                  {
-                  if (tex)
-                      {
-                      glBindTexture(GL_TEXTURE_2D, gTex[tex]);
-                      glUniform4f(gUInfo, 1.f / gTw[tex], 1.f / gTh[tex], (float)gWs[tex], (float)gWt[tex]);
-                      }
-                  gCurTex = tex;
-                  }
-              int textured = tex != 0;
-              if (textured != gTexturedState) { glUniform1f(gUTextured, textured ? 1.f : 0.f); gTexturedState = textured; }
-              if (aDepthWrite != gDepthWrite) { glDepthMask(aDepthWrite ? GL_TRUE : GL_FALSE); gDepthWrite = aDepthWrite; }
-              if (aBlend != gBlend)
-                  {
-                  if (aBlend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-                  gBlend = aBlend;
-                  }
-              if (aDepthEq != gEq)
-                  {
-                  // DS "depth equal": passes within 0x200 of the stored depth. Approximated by pulling the
-                  // polygon forward by that much and testing LEQUAL.
-                  glDepthFunc(aDepthEq ? GL_LEQUAL : GL_LESS);
-                  glUniform1f(gUBias, aDepthEq ? (2.f * 0x200 / 32767.f) : 0.f);
-                  gEq = aDepthEq;
-                  }
-              glDrawElements(aLines ? GL_LINES : GL_TRIANGLES, aCount, GL_UNSIGNED_SHORT, aIdx);
-              }
-
-          extern "C" int gles2_frame_end(unsigned int* aFb)
-              {
-              glReadPixels(0, 0, W3D, H3D, GL_RGBA, GL_UNSIGNED_BYTE, gPix);
-              if (eglGetError() == EGL_CONTEXT_LOST) return 1;
-              const unsigned char* s = gPix;
-              for (int i = 0; i < W3D * H3D; ++i, s += 4)
-                  aFb[i] = ((unsigned int)s[0] << 16) | ((unsigned int)s[1] << 8) | s[2];
-              return 0;
-              }
-
-          #endif // RE4_GLES2
           RE4_EOF
           mkdir -p symbian/shim/libc
           cat > symbian/shim/libc/limits.h <<'RE4_EOF'
@@ -3450,17 +2860,6 @@ jobs:
           #include <stdlib.h>
           #include <stdio.h>
           #include <math.h>
-
-          /* DS names that the OpenGL ES 2 headers use too (gx_gles2.cpp links the real ones): renamed here so
-             the game, the DS layer and the GLES 2 back end can live in one program */
-          #define glGenTextures ds_glGenTextures
-          #define glDeleteTextures ds_glDeleteTextures
-          #define glBindTexture ds_glBindTexture
-          #define glEnable ds_glEnable
-          #define glDisable ds_glDisable
-          #define glViewport ds_glViewport
-          #define glClearColor ds_glClearColor
-          #define glFlush ds_glFlush
 
           #ifdef __cplusplus
           extern "C" {
@@ -4025,31 +3424,12 @@ jobs:
                 -nostdinc -isystem $S/libc -I$S -Isymbian/gen -Isymbian/build_src "$f"
           done
           echo "32-bit freestanding syntax check OK"
-          # the same for the OpenGL ES 2.0 build of the DS layer (what Symbian compiles when the SDK has GLES 2)
-          gcc -m32 -std=gnu11 -O2 -fsyntax-only -DRE4_GLES2 -Wno-unused -Wno-misleading-indentation -fno-strict-aliasing \
-              -nostdinc -isystem $S/libc -I$S $S/gx.c
-          echo "GLES2 build of gx.c: 32-bit freestanding syntax check OK"
           # whole game links against the shim (main is provided by the stub file)
           gcc -o /tmp/hc/game /tmp/hc/*.o -lm
           echo "game + shim link OK"
           gcc $CF -c symbian/tools/render_test.c -o /tmp/hc/render_test.o
           gcc -o /tmp/hc/render_test /tmp/hc/render_test.o /tmp/hc/dsshim.c.o /tmp/hc/gx.c.o /tmp/hc/host_stubs.c.o -lm
           /tmp/hc/render_test
-          # OpenGL ES 2.0 back end for real, when the GLES / EGL headers are installed (CI: libgles2-mesa-dev,
-          # libegl1-mesa-dev): compile gx_gles2.cpp and run the same render test through Mesa. If the runner has
-          # no usable EGL pbuffer the layer falls back to the software renderer by design, so a run that stays
-          # on software is reported, not failed.
-          if [ -f /usr/include/GLES2/gl2.h ] && [ -f /usr/include/EGL/egl.h ]; then
-            mkdir -p /tmp/hcgl && rm -f /tmp/hcgl/*
-            g++ -O1 -Wall -DRE4_GLES2 -I$S -c $S/gx_gles2.cpp -o /tmp/hcgl/gles.o
-            gcc $CF -DRE4_GLES2 -c $S/gx.c -o /tmp/hcgl/gx.o
-            gcc $CF -c symbian/tools/render_test.c -o /tmp/hcgl/rt.o
-            g++ -o /tmp/hcgl/render_test_gl /tmp/hcgl/rt.o /tmp/hc/dsshim.c.o /tmp/hc/host_stubs.c.o /tmp/hcgl/gx.o /tmp/hcgl/gles.o -lm -lEGL -lGLESv2
-            echo "GLES2 back end compiles and links OK"
-            EGL_PLATFORM=surfaceless /tmp/hcgl/render_test_gl || echo "GLES2 render test did not pass on this runner (non-fatal)"
-          else
-            echo "GLES / EGL headers not installed: GLES2 back end not compiled here"
-          fi
           RE4_EOF
           mkdir -p symbian/tools
           cat > symbian/tools/host_stubs.c <<'RE4_EOF'
@@ -4213,8 +3593,6 @@ jobs:
     needs: sources
     runs-on: ubuntu-latest
     steps:
-      - name: Install GLES / EGL development packages (for the GLES 2 back end check)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgles-dev libegl-dev libgl1-mesa-dri
       - uses: actions/download-artifact@v4
         with:
           name: port-src
@@ -4293,26 +3671,6 @@ jobs:
             /Volumes/Symbian/sdks
             /Volumes/Symbian/gnupoc
           key: ${{ steps.cache.outputs.cache-primary-key }}
-
-      - name: Enable the OpenGL ES 2.0 renderer (required)
-        run: |
-          set -eo pipefail
-          source toolchain/Scripts/env.sh
-          ROOT="${EPOCROOT:-/Volumes/Symbian/sdks/symbian3/}"
-          has() { find "$ROOT/epoc32" -ipath "$1" 2>/dev/null | grep -q .; }
-          if ! { has '*/GLES2/gl2.h' && has '*/EGL/egl.h' && has '*/libglesv2.*' && has '*/libegl.*'; }; then
-            echo "ERROR: GLES 2 headers / import libraries not found in the SDK (this build has no software renderer)"
-            exit 1
-          fi
-          cat >> symbian/group/re4ds.mmp <<'MMP'
-
-          // OpenGL ES 2.0 back end of the DS 3D layer (falls back to software at run time)
-          MACRO           RE4_GLES2
-          SOURCEPATH      ../shim
-          SOURCE          gx_gles2.cpp
-          LIBRARY         libEGL.lib libGLESv2.lib
-          MMP
-          echo "GLES 2 renderer enabled"
 
       - name: Build RE4 DS
         run: |
