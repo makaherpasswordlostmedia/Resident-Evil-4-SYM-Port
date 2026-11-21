@@ -2295,7 +2295,7 @@ jobs:
                   {
                       const Tex *tx = &tex[ti];
                       int p2w = !(tx->w & (tx->w - 1)), p2h = !(tx->h & (tx->h - 1));
-                      glesr_tex_upload(ti, tx->w, tx->h, tx->px, tx->wrap_s && p2w, tx->wrap_t && p2h);
+                      glesr_tex_upload(ti, tx->w, tx->h, (const unsigned int *)tx->px, tx->wrap_s && p2w, tx->wrap_t && p2h);
                       gl_up[ti] = 1;
                   }
               }
@@ -2329,7 +2329,7 @@ jobs:
                   nv += gles_build_poly(p, gl_vb + nv * GLV);
               }
               gles_flush(ct, 1, cd, &nv);
-              glesr_end(shim_fb3d);
+              glesr_end((unsigned int *)shim_fb3d);
               return 1;
           }
 
