@@ -9,6 +9,9 @@ name: Build Symbian^3 SIS (RE4 DS)
 #   build-sis - Symbian^3 toolchain (fieldops-dev/symbian3-toolchain, macos-14 arm64 runner); the
 #               first run builds GCC (about 1.5-2 h) and caches it, later runs take minutes
 #
+# 3D: OpenGL ES 2.0 only (EGL pbuffer, shim/glesr.c; links libEGL/libGLESv2 from the SDK). There is no software
+# rasteriser in the build. The floor fix (tools/fix_floor.py) is part of this file too.
+#
 # The .sisx contains only the program. Game data goes to E:\RE4DS\data and E:\RE4DS\nitrofs
 # (see symbian/README.md).
 
@@ -1241,6 +1244,7 @@ jobs:
           SOURCEPATH      ../shim
           SOURCE          dsshim.c
           SOURCE          gx.c
+          SOURCE          glesr.c
           SOURCE          rt.c
 
           SOURCEPATH      ../gen
@@ -1270,6 +1274,7 @@ jobs:
           LIBRARY         euser.lib apparc.lib cone.lib eikcore.lib avkon.lib eikcoctl.lib
           LIBRARY         fbscli.lib bitgdi.lib gdi.lib ws32.lib efsrv.lib
           LIBRARY         mediaclientaudiostream.lib bafl.lib
+          LIBRARY         libEGL.lib libGLESv2.lib
 
           OPTION          GCCE -O2 -fno-strict-aliasing
           RE4_EOF
@@ -1740,18 +1745,16 @@ jobs:
           RE4_EOF
           mkdir -p symbian/shim
           cat > symbian/shim/gx.c <<'RE4_EOF'
-          // gx.c - software emulation of the DS 3D engine: matrix stacks, packed GX commands, clipping,
-          // a polygon buffer (2048 polygons / 6144 vertices like the hardware) and a scanline rasterizer
-          // (perspective-correct textures, vertex colour, alpha, fog, depth buffer). Integer only.
+          // gx.c - emulation of the DS 3D engine: matrix stacks, packed GX commands, clipping and a polygon
+          // buffer (2048 polygons / 6144 vertices like the hardware). The polygons are drawn by OpenGL ES 2.0
+          // (glesr.c); there is no software rasteriser.
           #include "nds.h"
 
           IntFn shim_irq_handler(int bit);
           extern volatile int shim_skip_render;
           extern volatile u32 shim_last_render;
-          static int shim_lowres;              /* 1: rasterise every second row / column (2x2 blocks), 4x cheaper */
 
           u32 shim_fb3d[256 * 192];
-          static u16 zbuf[256 * 192];
 
           /* ----------------------------------------------------------------- state */
           typedef struct { int m[16]; } Mat;            /* row vectors: v' = v * M, f32 entries */
@@ -1779,6 +1782,8 @@ jobs:
           #define MAX_TEX 640
           static Tex tex[MAX_TEX];
           static int bound_tex;
+          static u8 gl_up[MAX_TEX];            /* texture i is uploaded to the GPU */
+          void glesr_tex_free(int id);
 
           void glGenTextures(int n, int *names)
           {
@@ -1796,6 +1801,7 @@ jobs:
                   int i = names[k];
                   if (i <= 0 || i >= MAX_TEX) continue;
                   free(tex[i].px); free(tex[i].idx);
+                  if (gl_up[i]) { glesr_tex_free(i); gl_up[i] = 0; }
                   memset(&tex[i], 0, sizeof(Tex));
                   if (bound_tex == i) bound_tex = 0;
                   names[k] = 0;
@@ -1821,8 +1827,6 @@ jobs:
               return (a << 24) | ((r << 3 | r >> 2) << 16) | ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
           }
 
-          #define DBG_MAX_LINES 1500         /* the log stays short: at most this many diagnostic lines */
-          static int dbg_lines;
           int glTexImageNtr2D(GL_TEXTURE_TYPE_ENUM type, int w, int h, int param, const void *texels, const void *unused)
           {
               (void)unused;
@@ -1839,6 +1843,7 @@ jobs:
               }
               free(t->px); free(t->idx);
               t->px = 0; t->idx = 0;
+              if (gl_up[bound_tex]) { glesr_tex_free(bound_tex); gl_up[bound_tex] = 0; }
               t->w = (u16)w; t->h = (u16)h; t->type = (u8)type;
               t->has_alpha = type == GL_RGB8_A5 || type == GL_RGB32_A3;
               t->wrap_s = (param & GL_TEXTURE_WRAP_S) != 0;
@@ -1866,16 +1871,11 @@ jobs:
           {
               Tex *t = &tex[bound_tex];
               if (!bound_tex || !t->idx) return 0;
-              if (dbg_lines < DBG_MAX_LINES)
-              {
-                  char m[120];
-                  snprintf(m, sizeof m, "tex %d: type=%d %dx%d pal=%d color0=%d wrap=%d%d alpha=%d", bound_tex, t->type, t->w, t->h, count, t->color0, t->wrap_s, t->wrap_t, t->has_alpha);
-                  host_log(m); dbg_lines++;
-              }
               u32 n = (u32)t->w * t->h;
               u32 lut[256];
               for (int i = 0; i < 256; i++) lut[i] = i < count ? argb555(pal[i], 255) : (count > 0 ? argb555(pal[count - 1], 255) : 0);
               if (t->color0 && count > 0 && !t->has_alpha) lut[0] &= 0x00FFFFFF;
+              if (gl_up[bound_tex]) { glesr_tex_free(bound_tex); gl_up[bound_tex] = 0; }
               t->px = (u32 *)malloc(n * 4);
               if (!t->px) return 0;
               for (u32 i = 0; i < n; i++)
@@ -2033,13 +2033,6 @@ jobs:
           #define MAX_VERT 6144
           static Poly polys[MAX_POLY];
           static int npoly, nvert;
-          /* diagnostics (logged now and then) and the runtime options file data/gxopt.txt:
-             1 = swap front / back, 2 = no culling at all, 4 = fog off */
-          static int gx_opt;
-          static int dbg_kept, dbg_ktex, dbg_cullb, dbg_cullf, dbg_line, dbg_far, dbg_side, dbg_near, dbg_ovf, dbg_bigcull, dbg_bigkept;
-          /* per-polygon detail of the "floor candidates" (wide, in the lower half of the screen), on a few frames */
-          static int dbg_on, dbg_nc, dbg_nd;        /* dbg_on: this frame is a logged sample (one in 120) */
-          static int dbg_pw, dbg_pzf, dbg_pa0, dbg_pfs, dbg_pfn;
 
           typedef struct { int x, y, z, w, u, v; u8 r, g, b; } CV;
 
@@ -2090,6 +2083,10 @@ jobs:
               CV a[12], b[12];
               int m = 0;
               for (int i = 0; i < n; i++)
+                  for (int j = i + 1; j < n; j++)
+                      if (in[i].x == in[j].x && in[i].y == in[j].y && in[i].z == in[j].z && in[i].w == in[j].w)
+                          return;   /* (a repeated vertex: the empty triangle joining strip runs, no polygon) */
+              for (int i = 0; i < n; i++)
               {
                   const CV *p = &in[i], *q = &in[(i + 1) % n];
                   s64 dp = (s64)p->z + p->w, dq = (s64)q->z + q->w;
@@ -2097,7 +2094,7 @@ jobs:
                   if ((dp >= 0) != (dq >= 0))
                       lerp_cv(&a[m++], p, q, (dp << 16) / (dp - dq));
               }
-              if (m < 3) { dbg_near++; return; }
+              if (m < 3) return;
               /* the four sides of the view too, as the hardware does: a big floor / wall polygon would otherwise get
                  screen coordinates far outside the viewport, be clamped and its texture smear into streaks */
               for (int pl = 0; pl < 4; pl++)
@@ -2105,7 +2102,7 @@ jobs:
                   int neg = 0;
                   for (int i = 0; i < m; i++) if (plane_d(&a[i], pl) < 0) neg++;
                   if (neg == 0) continue;
-                  if (neg == m) { dbg_side++; return; }       /* wholly outside this side: nothing to draw */
+                  if (neg == m) return;                      /* wholly outside this side: nothing to draw */
                   int k = 0;
                   for (int i = 0; i < m; i++)
                   {
@@ -2116,12 +2113,12 @@ jobs:
                   }
                   for (int i = 0; i < k; i++) a[i] = b[i];
                   m = k;
-                  if (m < 3) { dbg_side++; return; }
+                  if (m < 3) return;
               }
               int out_far = 0;
               for (int i = 0; i < m; i++) if (a[i].z > a[i].w) out_far++;
-              if (out_far == m) { dbg_far++; return; }
-              if (npoly >= MAX_POLY || nvert + m > MAX_VERT) { dbg_ovf++; shim_gfx_control |= 1 << 13; return; }
+              if (out_far == m) return;
+              if (npoly >= MAX_POLY || nvert + m > MAX_VERT) { shim_gfx_control |= 1 << 13; return; }
 
               Poly *p = &polys[npoly];
               for (int i = 0; i < m; i++) to_screen(&p->v[i], &a[i]);
@@ -2134,45 +2131,16 @@ jobs:
               }
               int cull = (cur_attr >> 6) & 3;
               p->line = 0;
-              int wide = 0, floorish = 0;
-              {
-                  int mn = p->v[0].sx, mx = mn, sysum = 0;
-                  for (int i = 0; i < m; i++)
-                  {
-                      if (p->v[i].sx < mn) mn = p->v[i].sx;
-                      if (p->v[i].sx > mx) mx = p->v[i].sx;
-                      sysum += p->v[i].sy;
-                  }
-                  wide = mx - mn > 1600;                      /* wider than ~100 pixels: a floor or a wall */
-                  floorish = wide && sysum / m > 96 * 16;     /* ...in the lower half of the screen: the ground */
-              }
-              p->pad = (u8)floorish;
-              if (area == 0) { p->line = 1; dbg_line++; }
+              if (area == 0) p->line = 1;
               else
               {
                   int front = area > 0;
-                  if (gx_opt & 1) front = !front;
-                  if (!(gx_opt & 2) && (cull == 0 || (cull == 1 && front) || (cull == 2 && !front)))
-                  {
-                      if (cull == 0) dbg_cullb++; else if (cull == 1) dbg_cullf++; else dbg_cullb++;
-                      if (wide) dbg_bigcull++;
-                      if (dbg_on && floorish && dbg_nc < 6 && dbg_lines < DBG_MAX_LINES)
-                      {
-                          char lm[200];
-                          snprintf(lm, sizeof lm, "floor CULLED: cullmode=%d front=%d area=%d n=%d tex=%d x=%d..%d y=%d..%d z0=%d", cull, front, (int)(area >> 8), m,
-                                   bound_tex, p->v[0].sx >> 4, p->v[m / 2].sx >> 4, p->v[0].sy >> 4, p->v[m / 2].sy >> 4, p->v[0].z);
-                          host_log(lm); dbg_nc++; dbg_lines++;
-                      }
-                      return;
-                  }
+                  if (cull == 0 || (cull == 1 && front) || (cull == 2 && !front)) return;
               }
-              dbg_kept++;
-              if (wide) dbg_bigkept++;
               p->attr = cur_attr;
               p->tex = tex[bound_tex].used && tex[bound_tex].px ? bound_tex : 0;
               int alpha = (cur_attr >> 16) & 31;
               p->trans = (alpha < 31 || (p->tex && tex[p->tex].has_alpha)) ? 1 : 0;
-              if (p->tex) dbg_ktex++;
               npoly++;
               nvert += m;
           }
@@ -2248,292 +2216,143 @@ jobs:
               fog_dirty = 0;
           }
 
-          static void raster_tri(const Poly *p, const SV *a, const SV *b, const SV *c)
-          {
-              s64 x0 = a->sx, y0 = a->sy, x1 = b->sx, y1 = b->sy, x2 = c->sx, y2 = c->sy;
-              s64 area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
-              if (!area) return;
-              const SV *t = a, *m = b, *bt = c, *tmp;
-              if (m->sy < t->sy) { tmp = t; t = m; m = tmp; }
-              if (bt->sy < m->sy) { tmp = m; m = bt; bt = tmp; }
-              if (m->sy < t->sy) { tmp = t; t = m; m = tmp; }
-              int row0 = (t->sy + 7) >> 4, row1 = (bt->sy + 7) >> 4;
-              if (row0 < 0) row0 = 0;
-              if (row1 > 192) row1 = 192;
-              if (row0 >= row1 || bt->sy == t->sy) return;
+          /* ------------------------------------------------- OpenGL ES 2.0 back end (glesr.c) */
+          int glesr_init(void);
+          void glesr_tex_upload(int id, int w, int h, const unsigned int *argb, int rep_s, int rep_t);
+          void glesr_fog(const unsigned char *lut, int r, int g, int b);
+          void glesr_begin(int cr, int cg, int cb);
+          void glesr_draw(const float *v, int nv, int tex, int blend, int depthwrite);
+          void glesr_end(unsigned int *out);
 
+          static int gl_state;                  /* 0: not tried, 1: OpenGL ES 2.0 draws the 3D screen, -1: it could not start (no 3D) */
+          static int gl_fog_sent;
+          static float *gl_vb;
+          #define GLV 11
+          #define GL_VB_VERTS 16384
+
+          static void gles_probe(void)
+          {
+              gl_state = glesr_init() ? 1 : -1;
+              host_log(gl_state > 0 ? "renderer: OpenGL ES 2.0" : "renderer: OpenGL ES 2.0 FAILED to start (no 3D picture)");
+          }
+
+          /* One polygon as triangles: clip-space positions rebuilt from the screen coordinates and 1/w, so the
+             GPU interpolates texture, colour and fog perspective-correct, as the software path does. */
+          static int gles_build_poly(const Poly *p, float *o)
+          {
               const Tex *tx = p->tex ? &tex[p->tex] : 0;
-              const int textured = tx != 0;
-              const int nat = textured ? 7 : 5;
-              s64 A[7][3];
-              const SV *vs[3] = { a, b, c };
-              /* perspective only where it shows: a small or nearly flat-on triangle is interpolated linearly */
-              int persp = 0;
-              if (textured)
-              {
-                  int imin = a->iw, imax = a->iw;
-                  if (b->iw < imin) imin = b->iw; if (b->iw > imax) imax = b->iw;
-                  if (c->iw < imin) imin = c->iw; if (c->iw > imax) imax = c->iw;
-                  int spread = imax - imin;
-                  s64 ex = (x0 > x1 ? x0 : x1) > x2 ? (x0 > x1 ? x0 : x1) : x2;
-                  s64 nx = (x0 < x1 ? x0 : x1) < x2 ? (x0 < x1 ? x0 : x1) : x2;
-                  int small = (ex - nx) < 24 * 16 && (bt->sy - t->sy) < 24 * 16;
-                  persp = !(spread * 16 < imin || (small && spread * 4 < imin));
-              }
-              for (int i = 0; i < 3; i++)
-              {
-                  A[0][i] = (s64)vs[i]->z << 8;
-                  A[1][i] = (s64)vs[i]->r << 16; A[2][i] = (s64)vs[i]->g << 16; A[3][i] = (s64)vs[i]->b << 16;
-                  A[4][i] = vs[i]->iw;
-                  if (persp) { A[5][i] = (s64)vs[i]->u * vs[i]->iw; A[6][i] = (s64)vs[i]->v * vs[i]->iw; }
-                  else { A[5][i] = (s64)vs[i]->u << 8; A[6][i] = (s64)vs[i]->v << 8; }
-              }
-              s64 gx[7], gy[7];
-              static const int shf[7] = { 8, 8, 8, 8, 8, 0, 0 };
-              for (int k = 0; k < nat; k++)
-              {
-                  if (k == 4 && !persp) { gx[4] = gy[4] = 0; continue; }          /* (1/w is only needed for perspective) */
-                  s64 d1 = A[k][1] - A[k][0], d2 = A[k][2] - A[k][0];
-                  if (k >= 1 && k <= 3 && !d1 && !d2) { gx[k] = gy[k] = 0; continue; }   /* flat colour: no gradient */
-                  gx[k] = ((d1 * (y2 - y0) - d2 * (y1 - y0)) << shf[k]) / area;
-                  gy[k] = ((d2 * (x1 - x0) - d1 * (x2 - x0)) << shf[k]) / area;
-              }
-
-              /* edges */
-              s64 sl_long = ((s64)(bt->sx - t->sx) << 16) / (bt->sy - t->sy);
-              s64 sl_a = m->sy > t->sy ? ((s64)(m->sx - t->sx) << 16) / (m->sy - t->sy) : 0;
-              s64 sl_b = bt->sy > m->sy ? ((s64)(bt->sx - m->sx) << 16) / (bt->sy - m->sy) : 0;
-
+              const float fu = tx ? 1.0f / (16.0f * tx->w) : 0.0f, fv = tx ? 1.0f / (16.0f * tx->h) : 0.0f;
               const u32 attr = p->attr;
-              const int alpha = (attr >> 16) & 31;
-              const int fog = fog_on && !(gx_opt & 4) && (attr & POLY_FOG);
-              const int wdepth = !p->trans || (attr & POLY_NEW_DEPTH);
-              const int eqtest = (attr & POLY_DEPTHTEST_EQUAL) != 0;
-              const int tw = tx ? tx->w : 0, th = tx ? tx->h : 0;
-              const int ws = tx ? tx->wrap_s : 0, wt = tx ? tx->wrap_t : 0;
-              const int tw_p2 = !(tw & (tw - 1)), th_p2 = !(th & (th - 1));
-              const u32 fogc = (fog_r << 3 | fog_r >> 2) << 16 | (fog_g << 3 | fog_g >> 2) << 8 | (fog_b << 3 | fog_b >> 2);
-
-              const int S = shim_lowres ? 2 : 1;
-              const int dbg = dbg_on && p->pad;
-              if (S == 2) row0 += row0 & 1;
-              for (int row = row0; row < row1; row += S)
+              const float alpha = ((attr >> 16) & 31) * (1.0f / 31.0f);
+              const float fogf = (fog_on && (attr & POLY_FOG)) ? 1.0f : 0.0f;
+              const float zoff = (attr & POLY_DEPTHTEST_EQUAL) ? -0.04f : 0.0f;   /* "equal" decals: a little nearer */
+              const float cs = tx ? 1.0f / 32.0f : 1.0f / 31.0f, cb = tx ? 1.0f / 32.0f : 0.0f;
+              int n = 0;
+              for (int k = 1; k + 1 < p->n; k++)
               {
-                  s64 cy = row * 16 + 8;
-                  s64 xa = ((s64)t->sx << 16) + sl_long * (cy - t->sy), xb;
-                  if (cy < m->sy) xb = ((s64)t->sx << 16) + sl_a * (cy - t->sy);
-                  else xb = ((s64)m->sx << 16) + sl_b * (cy - m->sy);
-                  if (xb < xa) { s64 s = xa; xa = xb; xb = s; }
-                  int px0 = (int)((xa + ((s64)7 << 16)) >> 20), px1 = (int)((xb + ((s64)7 << 16)) >> 20);
-                  if (px0 < 0) px0 = 0;
-                  if (px1 > 256) px1 = 256;
-                  if (px0 >= px1) continue;
-                  if (S == 2) px0 &= ~1;
-
-                  s64 dX = (s64)px0 * 16 + 8 - x0, dY = cy - y0;
-                  s64 at[7];
-                  for (int k = 0; k < nat; k++) at[k] = A[k][0] + ((gx[k] * dX + gy[k] * dY) >> shf[k]);
-                  int z = (int)at[0];
-                  int r = (int)at[1], g = (int)at[2], bl = (int)at[3];
-                  int dz = (int)(gx[0] >> 4) * S, dr = (int)(gx[1] >> 4) * S, dg = (int)(gx[2] >> 4) * S, db = (int)(gx[3] >> 4) * S;
-
-                  int u = 0, v = 0, du = 0, dv = 0;
-                  int span = 0, eu = 0, ev = 0;
-                  if (textured && !persp) { u = (int)at[5]; v = (int)at[6]; du = (int)(gx[5] * 16) * S; dv = (int)(gx[6] * 16) * S; }
-                  u32 *fb = shim_fb3d + row * 256;
-                  u16 *zb = zbuf + row * 256;
-                  for (int x = px0; x < px1; x += S, z += dz, r += dr, g += dg, bl += db)
+                  const SV *vs[3] = { &p->v[0], &p->v[k], &p->v[k + 1] };
+                  for (int j = 0; j < 3; j++)
                   {
-                      if (persp && span <= 0)
-                      {
-                          /* 16-pixel spans, perspective-correct at their ends; each end is the next span's start */
-                          int n = px1 - x < 16 ? px1 - x : 16;
-                          if (x == px0)
-                          {
-                              s64 i0 = at[4] < 1 ? 1 : at[4];
-                              eu = (int)((at[5] * 256) / i0); ev = (int)((at[6] * 256) / i0);
-                          }
-                          s64 off = (s64)16 * (x - px0 + n);
-                          s64 iw1 = at[4] + ((gx[4] * off) >> 8);
-                          s64 uw1 = at[5] + gx[5] * off, vw1 = at[6] + gx[6] * off;
-                          if (iw1 < 1) iw1 = 1;
-                          int u1 = (int)((uw1 * 256) / iw1), v1 = (int)((vw1 * 256) / iw1);
-                          u = eu; v = ev;
-                          if (n == 16) { du = (u1 - eu) >> 4; dv = (v1 - ev) >> 4; }
-                          else { du = (u1 - eu) / n; dv = (v1 - ev) / n; }
-                          du *= S; dv *= S;
-                          eu = u1; ev = v1;
-                          span = n;
-                      }
-                      int zi = z >> 8;
-                      if (zi < 0) zi = 0; if (zi > 0x7FFF) zi = 0x7FFF;
-                      if (eqtest ? (zi - zb[x] > 0x200 || zb[x] - zi > 0x200) : (zi >= zb[x]))
-                      {
-                          if (dbg) dbg_pzf++;
-                          if (textured) { u += du; v += dv; span -= S; }
-                          continue;
-                      }
-                      int cr5 = r >> 16, cg5 = g >> 16, cb5 = bl >> 16;
-                      if (cr5 < 0) cr5 = 0; if (cr5 > 31) cr5 = 31;
-                      if (cg5 < 0) cg5 = 0; if (cg5 > 31) cg5 = 31;
-                      if (cb5 < 0) cb5 = 0; if (cb5 > 31) cb5 = 31;
-                      u32 pr, pg, pb;
-                      int a5 = alpha;
-                      if (textured)
-                      {
-                          int ui = u >> 12, vi = v >> 12;
-                          if (ws) { if (tw_p2) ui &= tw - 1; else { ui %= tw; if (ui < 0) ui += tw; } }
-                          else if (ui < 0) ui = 0; else if (ui >= tw) ui = tw - 1;
-                          if (wt) { if (th_p2) vi &= th - 1; else { vi %= th; if (vi < 0) vi += th; } }
-                          else if (vi < 0) vi = 0; else if (vi >= th) vi = th - 1;
-                          u32 tc = tx->px[vi * tw + ui];
-                          u += du; v += dv; span -= S;
-                          u32 ta = tc >> 24;
-                          if (ta == 0) { if (dbg) dbg_pa0++; continue; }
-                          pr = (((tc >> 16) & 255) * (cr5 + 1)) >> 5;
-                          pg = (((tc >> 8) & 255) * (cg5 + 1)) >> 5;
-                          pb = ((tc & 255) * (cb5 + 1)) >> 5;
-                          if (ta < 248) a5 = (int)(((ta >> 3) * alpha + 15) / 31);
-                      }
-                      else
-                      {
-                          pr = cr5 << 3 | cr5 >> 2; pg = cg5 << 3 | cg5 >> 2; pb = cb5 << 3 | cb5 >> 2;
-                      }
-                      if (a5 <= 0) continue;
-                      if (fog)
-                      {
-                          int d = fog_lut[zi];
-                          if (dbg) { dbg_pfs += d; dbg_pfn++; }
-                          pr += (int)(((int)((fogc >> 16) & 255) - (int)pr) * d) >> 7;
-                          pg += (int)(((int)((fogc >> 8) & 255) - (int)pg) * d) >> 7;
-                          pb += (int)(((int)(fogc & 255) - (int)pb) * d) >> 7;
-                      }
-                      if (a5 < 31)
-                      {
-                          u32 dst = fb[x];
-                          u32 dr_ = (dst >> 16) & 255, dg_ = (dst >> 8) & 255, db_ = dst & 255;
-                          pr = (pr * a5 + dr_ * (31 - a5)) * 33 >> 10;
-                          pg = (pg * a5 + dg_ * (31 - a5)) * 33 >> 10;
-                          pb = (pb * a5 + db_ * (31 - a5)) * 33 >> 10;
-                      }
-                      fb[x] = (pr & 255) << 16 | (pg & 255) << 8 | (pb & 255);
-                      if (dbg) dbg_pw++;
-                      if (wdepth) zb[x] = (u16)zi;
-                      if (S == 2)
-                      {
-                          fb[x + 1] = fb[x + 256] = fb[x + 257] = fb[x];
-                          if (wdepth) zb[x + 1] = zb[x + 256] = zb[x + 257] = (u16)zi;
-                      }
+                      const SV *s = vs[j];
+                      float w = s->iw > 0 ? 4194304.0f / (float)s->iw : 1.0f;   /* 2^34 / iw = w, in 1/4096 units */
+                      float x = s->sx * (1.0f / 2048.0f) - 1.0f;
+                      float y = s->sy * (1.0f / 1536.0f) - 1.0f;                 /* (row 0 = top of the picture) */
+                      float z = s->z * (1.0f / 16383.5f) - 1.0f + zoff;
+                      o[0] = x * w; o[1] = y * w; o[2] = z * w; o[3] = w;
+                      o[4] = s->u * fu; o[5] = s->v * fv;
+                      o[6] = (s->r + cb) * cs; o[7] = (s->g + cb) * cs; o[8] = (s->b + cb) * cs;
+                      o[9] = alpha; o[10] = fogf;
+                      o += GLV;
+                      n++;
                   }
               }
+              return n;
           }
 
-          static void raster_line(const Poly *p)
+          static void gles_flush(int tex, int blend, int dw, int *nv)
           {
-              /* degenerate polygon: the DS draws it as a line between the extreme vertices */
-              int bi = 0, bj = 0;
-              s64 best = -1;
-              for (int i = 0; i < p->n; i++)
-                  for (int j = i + 1; j < p->n; j++)
-                  {
-                      s64 dx = p->v[i].sx - p->v[j].sx, dy = p->v[i].sy - p->v[j].sy, d = dx * dx + dy * dy;
-                      if (d > best) { best = d; bi = i; bj = j; }
-                  }
-              int x0 = p->v[bi].sx >> 4, y0 = p->v[bi].sy >> 4, x1 = p->v[bj].sx >> 4, y1 = p->v[bj].sy >> 4;
-              int dx = x1 > x0 ? x1 - x0 : x0 - x1, dy = y1 > y0 ? y1 - y0 : y0 - y1;
-              int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx - dy, steps = dx > dy ? dx : dy;
-              u32 col = ((u32)(p->v[0].r << 3 | p->v[0].r >> 2) << 16) | ((u32)(p->v[0].g << 3 | p->v[0].g >> 2) << 8) |
-                        (u32)(p->v[0].b << 3 | p->v[0].b >> 2);
-              int z = p->v[bi].z;
-              for (int i = 0; i <= steps && i < 600; i++)
+              if (*nv)
+                  glesr_draw(gl_vb, *nv, tex, blend, dw);
+              *nv = 0;
+          }
+
+          static int render_gles(void)
+          {
+              static int cnt[MAX_TEX + 2];
+              static u16 order[MAX_POLY];
+              if (!gl_vb)
               {
-                  if (x0 >= 0 && x0 < 256 && y0 >= 0 && y0 < 192 && z < zbuf[y0 * 256 + x0])
-                  {
-                      shim_fb3d[y0 * 256 + x0] = col;
-                      if (!p->trans) zbuf[y0 * 256 + x0] = (u16)z;
-                  }
-                  int e2 = 2 * err;
-                  if (e2 > -dy) { err -= dy; x0 += sx; }
-                  if (e2 < dx) { err += dx; y0 += sy; }
+                  gl_vb = (float *)malloc((size_t)GL_VB_VERTS * GLV * sizeof(float));
+                  if (!gl_vb) return 0;
               }
-          }
-
-          static void render_all(void)
-          {
-              u32 clear = (u32)((clr_r << 3 | clr_r >> 2) << 16 | (clr_g << 3 | clr_g >> 2) << 8 | (clr_b << 3 | clr_b >> 2));
-              for (int i = 0; i < 256 * 192; i++) { shim_fb3d[i] = clear; zbuf[i] = (u16)clr_depth; }
-              if (fog_dirty) rebuild_fog();
-              for (int pass = 0; pass < 2; pass++)
-                  for (int i = 0; i < npoly; i++)
+              if (fog_dirty) { rebuild_fog(); gl_fog_sent = 0; }
+              glesr_fog(gl_fog_sent ? 0 : fog_lut, fog_r << 3 | fog_r >> 2, fog_g << 3 | fog_g >> 2, fog_b << 3 | fog_b >> 2);
+              gl_fog_sent = 1;
+              for (int i = 0; i < npoly; i++)       /* textures not on the GPU yet */
+              {
+                  int ti = polys[i].tex;
+                  if (ti && !gl_up[ti])
                   {
-                      const Poly *p = &polys[i];
-                      if (p->trans != pass) continue;
-                      if (p->line) { if (!p->tex) raster_line(p); continue; }   /* (a textured sliver would be a white line) */
-                      const int dbg = dbg_on && p->pad && dbg_nd < 8 && dbg_lines < DBG_MAX_LINES;
-                      if (dbg) { dbg_pw = dbg_pzf = dbg_pa0 = dbg_pfs = dbg_pfn = 0; }
-                      for (int k = 1; k + 1 < p->n; k++) raster_tri(p, &p->v[0], &p->v[k], &p->v[k + 1]);
-                      if (dbg)
-                      {
-                          char lm[260];
-                          const Tex *tt = p->tex ? &tex[p->tex] : 0;
-                          snprintf(lm, sizeof lm, "floor DRAWN: n=%d tex=%d(%dx%d t%d px0=%08x) cullmode=%d alpha=%d trans=%d fogpoly=%d y=%d..%d z=%d..%d wrote=%d zfail=%d alpha0=%d fogavg=%d",
-                                   p->n, p->tex, tt ? tt->w : 0, tt ? tt->h : 0, tt ? tt->type : 0, (tt && tt->px) ? (unsigned)tt->px[0] : 0u,
-                                   (int)((p->attr >> 6) & 3), (int)((p->attr >> 16) & 31), p->trans, (p->attr & POLY_FOG) != 0,
-                                   p->v[0].sy >> 4, p->v[p->n / 2].sy >> 4, p->v[0].z, p->v[p->n / 2].z,
-                                   dbg_pw, dbg_pzf, dbg_pa0, dbg_pfn ? dbg_pfs / dbg_pfn : -1);
-                          host_log(lm); dbg_nd++; dbg_lines++;
-                      }
+                      const Tex *tx = &tex[ti];
+                      int p2w = !(tx->w & (tx->w - 1)), p2h = !(tx->h & (tx->h - 1));
+                      glesr_tex_upload(ti, tx->w, tx->h, tx->px, tx->wrap_s && p2w, tx->wrap_t && p2h);
+                      gl_up[ti] = 1;
                   }
+              }
+              glesr_begin(clr_r, clr_g, clr_b);
+
+              /* opaque: by texture (they write depth, so the order does not matter) */
+              memset(cnt, 0, sizeof cnt);
+              for (int i = 0; i < npoly; i++)
+                  if (!polys[i].trans && !polys[i].line) cnt[polys[i].tex + 1]++;
+              for (int t = 0; t < MAX_TEX; t++) cnt[t + 1] += cnt[t];
+              int no = 0;
+              for (int i = 0; i < npoly; i++)
+                  if (!polys[i].trans && !polys[i].line) { order[cnt[polys[i].tex]++] = (u16)i; no++; }
+              int nv = 0, cur = -1;
+              for (int k = 0; k < no; k++)
+              {
+                  const Poly *p = &polys[order[k]];
+                  if (p->tex != cur || nv + 24 > GL_VB_VERTS) { gles_flush(cur, 0, 1, &nv); cur = p->tex; }
+                  nv += gles_build_poly(p, gl_vb + nv * GLV);
+              }
+              gles_flush(cur, 0, 1, &nv);
+
+              /* translucent: in the order sent */
+              int ct = -1, cd = -1;
+              for (int i = 0; i < npoly; i++)
+              {
+                  const Poly *p = &polys[i];
+                  if (!p->trans || p->line) continue;
+                  int dw = (p->attr & POLY_NEW_DEPTH) != 0;
+                  if (p->tex != ct || dw != cd || nv + 24 > GL_VB_VERTS) { gles_flush(ct, 1, cd, &nv); ct = p->tex; cd = dw; }
+                  nv += gles_build_poly(p, gl_vb + nv * GLV);
+              }
+              gles_flush(ct, 1, cd, &nv);
+              glesr_end(shim_fb3d);
+              return 1;
           }
 
           void glFlush(u32 flags)
           {
               (void)flags;
               shim_dma_run();
-              static int first = 1, nflush;
+              static int first = 1;
               if (first)
               {
                   char m[64];
                   snprintf(m, sizeof m, "first glFlush: %d polys", npoly);
                   host_log(m);
                   first = 0;
-                  dbg_on = 1;                                 /* the very first frame is a sample too */
-                  FILE *of = fopen("data/gxopt.txt", "rb");
-                  if (of)
-                  {
-                      char ob[16] = { 0 };
-                      size_t on = fread(ob, 1, 15, of);
-                      fclose(of);
-                      for (size_t i = 0; i < on && ob[i] >= '0' && ob[i] <= '9'; i++) gx_opt = gx_opt * 10 + (ob[i] - '0');
-                      snprintf(m, sizeof m, "gxopt: %d", gx_opt);
-                      host_log(m);
-                  }
               }
-              nflush++;
-              if (dbg_on && dbg_lines < DBG_MAX_LINES)
+              if (!shim_skip_render)
               {
-                  char m[200];
-                  snprintf(m, sizeof m, "gx: kept=%d tex=%d cullB=%d cullF=%d line=%d far=%d side=%d near=%d ovf=%d bigcull=%d bigkept=%d fog=%d/%d/%d",
-                           dbg_kept, dbg_ktex, dbg_cullb, dbg_cullf, dbg_line, dbg_far, dbg_side, dbg_near, dbg_ovf, dbg_bigcull, dbg_bigkept, fog_on, fog_off, fog_shift);
-                  host_log(m);
-              }
-              dbg_lines++;
-              dbg_kept = dbg_ktex = dbg_cullb = dbg_cullf = dbg_line = dbg_far = dbg_side = dbg_near = dbg_ovf = dbg_bigcull = dbg_bigkept = 0;
-              dbg_nc = dbg_nd = 0;
-              const int dbg_frame = dbg_on;
-              if (!shim_skip_render || dbg_frame)
-              {
-                  u32 t0 = host_ticks_ms();
-                  render_all();
-                  u32 t1 = host_ticks_ms();
-                  shim_last_render = t1;
-                  u32 dt = t1 - t0;
-                  /* a slow pass: draw in 2x2 blocks until it is cheap enough to go back to full resolution */
-                  if (shim_lowres) { if (dt < 14) shim_lowres = 0; }
-                  else if (dt > 55) shim_lowres = 1;
+                  if (gl_state == 0) gles_probe();
+                  if (gl_state > 0)
+                      render_gles();
+                  shim_last_render = host_ticks_ms();
               }
               npoly = nvert = 0;
-              dbg_on = (nflush % 120) == 119;               /* the next frame is logged: about every 2 s */
           }
 
           /* ---------------------------------------------------- misc gl* and status */
@@ -2675,6 +2494,279 @@ jobs:
           }
 
           int dmaBusy(int ch) { (void)ch; shim_dma_run(); return 0; }
+          RE4_EOF
+          cat > symbian/shim/glesr.c <<'RE4_EOF'
+          /* glesr.c - OpenGL ES 2.0 back end for the software GX (gx.c collects and clips the DS polygons;
+             this draws them on the GPU into a 256x192 pbuffer and reads the picture back into shim_fb3d).
+             This file must not include nds.h: that header renames the shim's own gl* functions,
+             whose names are the real GL ones used below. */
+          #include <stdlib.h>
+          #include <string.h>
+
+          int glesr_init(void);
+          void glesr_tex_upload(int id, int w, int h, const unsigned int *argb, int rep_s, int rep_t);
+          void glesr_tex_free(int id);
+          void glesr_fog(const unsigned char *lut, int r, int g, int b);
+          void glesr_begin(int cr, int cg, int cb);
+          void glesr_draw(const float *v, int nv, int tex, int blend, int depthwrite);
+          void glesr_end(unsigned int *out);
+
+
+          typedef unsigned int GLenum, GLuint, GLbitfield;
+          typedef int GLint, GLsizei;
+          typedef unsigned char GLboolean;
+          typedef float GLfloat;
+          typedef char GLchar;
+          typedef void *EGLDisplay, *EGLConfig, *EGLSurface, *EGLContext;
+          typedef int EGLint;
+          typedef unsigned int EGLBoolean;
+
+          EGLDisplay eglGetDisplay(void *id);
+          EGLBoolean eglInitialize(EGLDisplay d, EGLint *major, EGLint *minor);
+          EGLBoolean eglBindAPI(unsigned int api);
+          EGLBoolean eglChooseConfig(EGLDisplay d, const EGLint *attr, EGLConfig *cfg, EGLint size, EGLint *num);
+          EGLSurface eglCreatePbufferSurface(EGLDisplay d, EGLConfig cfg, const EGLint *attr);
+          EGLContext eglCreateContext(EGLDisplay d, EGLConfig cfg, EGLContext share, const EGLint *attr);
+          EGLBoolean eglMakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EGLContext ctx);
+
+          GLuint glCreateShader(GLenum type);
+          void glShaderSource(GLuint s, GLsizei count, const GLchar *const *src, const GLint *len);
+          void glCompileShader(GLuint s);
+          void glGetShaderiv(GLuint s, GLenum pname, GLint *p);
+          GLuint glCreateProgram(void);
+          void glAttachShader(GLuint p, GLuint s);
+          void glBindAttribLocation(GLuint p, GLuint i, const GLchar *name);
+          void glLinkProgram(GLuint p);
+          void glGetProgramiv(GLuint p, GLenum pname, GLint *v);
+          void glUseProgram(GLuint p);
+          GLint glGetUniformLocation(GLuint p, const GLchar *name);
+          void glUniform1i(GLint loc, GLint v);
+          void glUniform3f(GLint loc, GLfloat a, GLfloat b, GLfloat c);
+          void glEnableVertexAttribArray(GLuint i);
+          void glVertexAttribPointer(GLuint i, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void *ptr);
+          void glDrawArrays(GLenum mode, GLint first, GLsizei count);
+          void glGenTextures(GLsizei n, GLuint *t);
+          void glDeleteTextures(GLsizei n, const GLuint *t);
+          void glBindTexture(GLenum target, GLuint t);
+          void glActiveTexture(GLenum unit);
+          void glTexParameteri(GLenum target, GLenum pname, GLint v);
+          void glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLint border, GLenum fmt, GLenum type, const void *px);
+          void glPixelStorei(GLenum pname, GLint v);
+          void glViewport(GLint x, GLint y, GLsizei w, GLsizei h);
+          void glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a);
+          void glClearDepthf(GLfloat d);
+          void glClear(GLbitfield m);
+          void glEnable(GLenum cap);
+          void glDisable(GLenum cap);
+          void glDepthFunc(GLenum f);
+          void glDepthMask(GLboolean m);
+          void glBlendFunc(GLenum s, GLenum d);
+          void glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum fmt, GLenum type, void *px);
+
+          #define GLV 11                         /* floats per vertex: pos4 uv2 colour+alpha4 fog1 */
+          #define MAXT 640
+
+          static GLuint prog, white_tex, fog_tex, gl_tex[MAXT];
+          static GLint loc_tex, loc_fog, loc_fogc;
+          static float fog_c[3];
+          static unsigned char *rb;
+
+          static const char *vs_src =
+              "attribute vec4 a_pos;\n"
+              "attribute vec2 a_uv;\n"
+              "attribute vec4 a_col;\n"
+              "attribute float a_fog;\n"
+              "varying vec2 v_uv;\n"
+              "varying vec4 v_col;\n"
+              "varying float v_fog;\n"
+              "void main() { gl_Position = a_pos; v_uv = a_uv; v_col = a_col; v_fog = a_fog; }\n";
+
+          static const char *fs_src =
+              "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+              "precision highp float;\n"
+              "#else\n"
+              "precision mediump float;\n"
+              "#endif\n"
+              "uniform sampler2D u_tex;\n"
+              "uniform sampler2D u_fogtab;\n"
+              "uniform vec3 u_fogc;\n"
+              "varying vec2 v_uv;\n"
+              "varying vec4 v_col;\n"
+              "varying float v_fog;\n"
+              "void main() {\n"
+              "  vec4 t = texture2D(u_tex, v_uv);\n"
+              "  if (t.a < 0.01) discard;\n"
+              "  vec3 c = t.rgb * v_col.rgb;\n"
+              "  float a = v_col.a;\n"
+              "  if (t.a < 0.97) a *= t.a;\n"
+              "  if (v_fog > 0.5) {\n"
+              "    float zi = floor(gl_FragCoord.z * 32767.0 + 0.5);\n"
+              "    float row = floor(zi / 256.0);\n"
+              "    float col = zi - row * 256.0;\n"
+              "    float f = texture2D(u_fogtab, vec2((col + 0.5) / 256.0, (row + 0.5) / 128.0)).r * 0.9961;\n"
+              "    c = mix(c, u_fogc, f);\n"
+              "  }\n"
+              "  gl_FragColor = vec4(c, a);\n"
+              "}\n";
+
+          static GLuint compile(GLenum type, const char *src)
+          {
+              GLuint s = glCreateShader(type);
+              GLint ok = 0;
+              if (!s) return 0;
+              glShaderSource(s, 1, &src, 0);
+              glCompileShader(s);
+              glGetShaderiv(s, 0x8B81, &ok);            /* GL_COMPILE_STATUS */
+              return ok ? s : 0;
+          }
+
+          static void new_tex(GLuint *t)
+          {
+              glGenTextures(1, t);
+              glBindTexture(0x0DE1, *t);
+              glTexParameteri(0x0DE1, 0x2800, 0x2600);  /* MAG, NEAREST */
+              glTexParameteri(0x0DE1, 0x2801, 0x2600);  /* MIN, NEAREST */
+              glTexParameteri(0x0DE1, 0x2802, 0x812F);  /* clamp to edge */
+              glTexParameteri(0x0DE1, 0x2803, 0x812F);
+          }
+
+          int glesr_init(void)
+          {
+              EGLint maj, min, n = 0;
+              EGLConfig cfg;
+              EGLDisplay d = eglGetDisplay((void *)0);
+              if (!d || !eglInitialize(d, &maj, &min)) return 0;
+              if (!eglBindAPI(0x30A0)) return 0;                                   /* EGL_OPENGL_ES_API */
+              {
+                  const EGLint ca[] = { 0x3033, 1, 0x3040, 4, 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3025, 16, 0x3038 };
+                  if (!eglChooseConfig(d, ca, &cfg, 1, &n) || n < 1) return 0;
+              }
+              {
+                  const EGLint pa[] = { 0x3057, 256, 0x3056, 192, 0x3038 };
+                  const EGLint xa[] = { 0x3098, 2, 0x3038 };
+                  EGLSurface s = eglCreatePbufferSurface(d, cfg, pa);
+                  EGLContext c;
+                  if (!s) return 0;
+                  c = eglCreateContext(d, cfg, (void *)0, xa);
+                  if (!c || !eglMakeCurrent(d, s, s, c)) return 0;
+              }
+              {
+                  GLuint vs = compile(0x8B31, vs_src), fs = compile(0x8B30, fs_src);
+                  GLint ok = 0;
+                  if (!vs || !fs) return 0;
+                  prog = glCreateProgram();
+                  glAttachShader(prog, vs);
+                  glAttachShader(prog, fs);
+                  glBindAttribLocation(prog, 0, "a_pos");
+                  glBindAttribLocation(prog, 1, "a_uv");
+                  glBindAttribLocation(prog, 2, "a_col");
+                  glBindAttribLocation(prog, 3, "a_fog");
+                  glLinkProgram(prog);
+                  glGetProgramiv(prog, 0x8B82, &ok);                               /* GL_LINK_STATUS */
+                  if (!ok) return 0;
+              }
+              glUseProgram(prog);
+              loc_tex = glGetUniformLocation(prog, "u_tex");
+              loc_fog = glGetUniformLocation(prog, "u_fogtab");
+              loc_fogc = glGetUniformLocation(prog, "u_fogc");
+              glPixelStorei(0x0CF5, 1);                                            /* unpack alignment */
+              {
+                  static const unsigned char white[4] = { 255, 255, 255, 255 };
+                  new_tex(&white_tex);
+                  glTexImage2D(0x0DE1, 0, 0x1908, 1, 1, 0, 0x1908, 0x1401, white);
+                  new_tex(&fog_tex);
+              }
+              rb = (unsigned char *)malloc(256 * 192 * 4);
+              return rb != 0;
+          }
+
+          void glesr_tex_upload(int id, int w, int h, const unsigned int *argb, int rep_s, int rep_t)
+          {
+              unsigned char *t;
+              int n = w * h;
+              if (id <= 0 || id >= MAXT || !argb) return;
+              t = (unsigned char *)malloc((size_t)n * 4);
+              if (!t) return;
+              for (int i = 0; i < n; i++)
+              {
+                  unsigned int c = argb[i];
+                  t[i * 4] = (unsigned char)(c >> 16);
+                  t[i * 4 + 1] = (unsigned char)(c >> 8);
+                  t[i * 4 + 2] = (unsigned char)c;
+                  t[i * 4 + 3] = (unsigned char)(c >> 24);
+              }
+              if (!gl_tex[id]) new_tex(&gl_tex[id]);
+              glBindTexture(0x0DE1, gl_tex[id]);
+              glTexParameteri(0x0DE1, 0x2802, rep_s ? 0x2901 : 0x812F);
+              glTexParameteri(0x0DE1, 0x2803, rep_t ? 0x2901 : 0x812F);
+              glTexImage2D(0x0DE1, 0, 0x1908, w, h, 0, 0x1908, 0x1401, t);
+              free(t);
+          }
+
+          void glesr_tex_free(int id)
+          {
+              if (id > 0 && id < MAXT && gl_tex[id])
+              {
+                  glDeleteTextures(1, &gl_tex[id]);
+                  gl_tex[id] = 0;
+              }
+          }
+
+          void glesr_fog(const unsigned char *lut, int r, int g, int b)
+          {
+              fog_c[0] = r / 255.0f; fog_c[1] = g / 255.0f; fog_c[2] = b / 255.0f;
+              if (lut)
+              {
+                  unsigned char *t = (unsigned char *)malloc(0x8000);
+                  if (!t) return;
+                  for (int i = 0; i < 0x8000; i++) t[i] = (unsigned char)(lut[i] * 2);
+                  glBindTexture(0x0DE1, fog_tex);
+                  glTexImage2D(0x0DE1, 0, 0x1909, 256, 128, 0, 0x1909, 0x1401, t);   /* LUMINANCE */
+                  free(t);
+              }
+          }
+
+          void glesr_begin(int cr, int cg, int cb)
+          {
+              glUseProgram(prog);
+              glViewport(0, 0, 256, 192);
+              glEnable(0x0B71);                                                    /* depth test */
+              glDepthFunc(0x0201);                                                 /* LESS */
+              glDepthMask(1);
+              glDisable(0x0BE2);                                                   /* blend */
+              glDisable(0x0B44);                                                   /* cull face */
+              glClearColor((cr << 3 | cr >> 2) / 255.0f, (cg << 3 | cg >> 2) / 255.0f, (cb << 3 | cb >> 2) / 255.0f, 1.0f);
+              glClearDepthf(1.0f);
+              glClear(0x4100);                                                     /* colour + depth */
+              glUniform1i(loc_tex, 0);
+              glUniform1i(loc_fog, 1);
+              glUniform3f(loc_fogc, fog_c[0], fog_c[1], fog_c[2]);
+              glActiveTexture(0x84C1);
+              glBindTexture(0x0DE1, fog_tex);
+              glActiveTexture(0x84C0);
+              for (int i = 0; i < 4; i++) glEnableVertexAttribArray(i);
+          }
+
+          void glesr_draw(const float *v, int nv, int tex, int blend, int depthwrite)
+          {
+              const GLsizei stride = GLV * 4;
+              glBindTexture(0x0DE1, (tex > 0 && tex < MAXT && gl_tex[tex]) ? gl_tex[tex] : white_tex);
+              if (blend) { glEnable(0x0BE2); glBlendFunc(0x0302, 0x0303); } else glDisable(0x0BE2);
+              glDepthMask(depthwrite ? 1 : 0);
+              glVertexAttribPointer(0, 4, 0x1406, 0, stride, v);
+              glVertexAttribPointer(1, 2, 0x1406, 0, stride, v + 4);
+              glVertexAttribPointer(2, 4, 0x1406, 0, stride, v + 6);
+              glVertexAttribPointer(3, 1, 0x1406, 0, stride, v + 10);
+              glDrawArrays(4, 0, nv);                                              /* GL_TRIANGLES */
+          }
+
+          void glesr_end(unsigned int *out)
+          {
+              glDepthMask(1);
+              glReadPixels(0, 0, 256, 192, 0x1908, 0x1401, rb);
+              for (int i = 0; i < 256 * 192; i++)
+                  out[i] = (unsigned int)rb[i * 4] << 16 | (unsigned int)rb[i * 4 + 1] << 8 | rb[i * 4 + 2];
+          }
           RE4_EOF
           mkdir -p symbian/shim/libc
           cat > symbian/shim/libc/limits.h <<'RE4_EOF'
@@ -2868,6 +2960,16 @@ jobs:
           #endif
 
           #define main re4_main       /* the game's main() becomes the worker-thread entry */
+
+          /* the DS names that are also OpenGL ES names: renamed, so the GLES2 back end (glesr.c) can link the real ones */
+          #define glGenTextures    shim_glGenTextures
+          #define glDeleteTextures shim_glDeleteTextures
+          #define glBindTexture    shim_glBindTexture
+          #define glClearColor     shim_glClearColor
+          #define glEnable         shim_glEnable
+          #define glDisable        shim_glDisable
+          #define glViewport       shim_glViewport
+          #define glFlush          shim_glFlush
 
           typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
           typedef int8_t s8; typedef int16_t s16; typedef int32_t s32; typedef int64_t s64;
@@ -3411,7 +3513,7 @@ jobs:
           mkdir -p symbian/tools
           cat > symbian/tools/host_check.sh <<'RE4_EOF'
           #!/bin/bash
-          # Host build of the whole game against the shim + a rasterizer smoke test. Run from the repo root
+          # Host build of the whole game against the shim (the OpenGL ES side is stubbed on the host). Run from the repo root
           # after tools/prepare.sh.
           set -euo pipefail
           S=symbian/shim
@@ -3421,7 +3523,7 @@ jobs:
             gcc $CF -c "$f" -o "/tmp/hc/$(basename "$f").o"
           done
           # 32-bit, freestanding (-nostdinc + our own libc headers): what the Symbian compiler will see
-          for f in symbian/build_src/*.c $S/dsshim.c $S/gx.c $S/rt.c symbian/gen/databins.c; do
+          for f in symbian/build_src/*.c $S/dsshim.c $S/gx.c $S/glesr.c $S/rt.c symbian/gen/databins.c; do
             gcc -m32 -std=gnu11 -O2 -fsyntax-only -Wno-unused -Wno-misleading-indentation -fno-strict-aliasing \
                 -nostdinc -isystem $S/libc -I$S -Isymbian/gen -Isymbian/build_src "$f"
           done
@@ -3429,9 +3531,6 @@ jobs:
           # whole game links against the shim (main is provided by the stub file)
           gcc -o /tmp/hc/game /tmp/hc/*.o -lm
           echo "game + shim link OK"
-          gcc $CF -c symbian/tools/render_test.c -o /tmp/hc/render_test.o
-          gcc -o /tmp/hc/render_test /tmp/hc/render_test.o /tmp/hc/dsshim.c.o /tmp/hc/gx.c.o /tmp/hc/host_stubs.c.o -lm
-          /tmp/hc/render_test
           RE4_EOF
           mkdir -p symbian/tools
           cat > symbian/tools/host_stubs.c <<'RE4_EOF'
@@ -3443,6 +3542,14 @@ jobs:
           void host_lock(void) {}
           void host_unlock(void) {}
           void host_log(const char *m) { (void)m; }
+          /* OpenGL ES 2.0 back end (glesr.c, needs the phone's GPU): not on the host */
+          int glesr_init(void) { return 0; }
+          void glesr_tex_upload(int id, int w, int h, const unsigned int *argb, int rep_s, int rep_t) { (void)id; (void)w; (void)h; (void)argb; (void)rep_s; (void)rep_t; }
+          void glesr_tex_free(int id) { (void)id; }
+          void glesr_fog(const unsigned char *lut, int r, int g, int b) { (void)lut; (void)r; (void)g; (void)b; }
+          void glesr_begin(int cr, int cg, int cb) { (void)cr; (void)cg; (void)cb; }
+          void glesr_draw(const float *v, int nv, int tex, int blend, int depthwrite) { (void)v; (void)nv; (void)tex; (void)blend; (void)depthwrite; }
+          void glesr_end(unsigned int *out) { (void)out; }
           RE4_EOF
           mkdir -p symbian/tools
           cat > symbian/tools/prepare.sh <<'RE4_EOF'
@@ -3519,6 +3626,8 @@ jobs:
           }
           CEOF
           } > "$GEN/databins.c"
+          # 3b. the floor under Leon is never dropped by the stage budget
+          python3 symbian/tools/fix_floor.py "$OUT"
           # 4. the .mmp: the game's C files are listed from what is actually in ds/source
           srcs=$(cd "$OUT" && ls *.c | sed 's/^/SOURCE          /')
           awk -v list="$srcs" '{ if ($0 == "@GAME_SOURCES@") print list; else print }' symbian/group/re4ds.mmp.in > symbian/group/re4ds.mmp
@@ -3581,6 +3690,179 @@ jobs:
               fprintf(stderr, fails ? "render test FAILED\n" : "render test OK\n");
               return fails ? 1 : 0;
           }
+          RE4_EOF
+          mkdir -p symbian/tools
+          cat > symbian/tools/fix_floor.py <<'RE4_EOF'
+          #!/usr/bin/env python3
+          # fix_floor.py <build_src>: the floor under Leon is never what the stage's triangle budget drops
+          # (model_draw_near sends the chunk Leon stands on first, outside the budget).
+          import sys
+          d = sys.argv[1]
+          def rd(n): return open(d + '/' + n).read()
+          def wr(n, s): open(d + '/' + n, 'w').write(s)
+          def rep(t, old, new):
+              assert t.count(old) == 1, old
+              return t.replace(old, new)
+
+          h = rd('model.h')
+          h = rep(h, "// Waits until a model_draw_async() transfer has finished.", """// The floor under the player: model_draw_near() always sends the chunk(s) holding this point
+          // (f32 x, y = feet, z) first and outside the triangle budget (up to a cap). NULL: none.
+          void model_set_anchor(const int p[3]);
+
+          // Waits until a model_draw_async() transfer has finished.""")
+          wr('model.h', h)
+
+          c = rd('model.c')
+          a = c.index("void model_draw_near(Model *m")
+          b = c.index("void model_sync(void)")
+          NEW = r"""static int anchor_on, anchor_pos[3];
+          #define ANCHOR_TRI_MAX 900            // the floor's own share, outside the budget
+          #define ANCHOR_FIRST_MAX 1500         // (the first one is taken whatever the cap)
+          #define ANCHOR_Y_MARGIN inttof32(8)
+
+          void model_set_anchor(const int p[3])
+          {
+              anchor_on = p != NULL;
+              if (p)
+                  memcpy(anchor_pos, p, sizeof(anchor_pos));
+          }
+
+          static void chain_add(const Model *m, int i, int *n)
+          {
+              u32 from = i ? m->draws[i - 1].list_at : 0;
+              chain[*n].src = m->async_list + from;
+              chain[(*n)++].words = m->draws[i].list_at - from;
+          }
+
+          void model_draw_near(Model *m, const int eye[3], const int at[3], int budget, u32 poly_fmt)
+          {
+              static int irq_set;
+              static s16 head[NEAR_BUCKETS], next[MODEL_MAX_DRAWS];
+              static u8 anchor_of[MODEL_MAX_DRAWS], taken[MODEL_MAX_DRAWS];
+              model_sync();
+              if (!irq_set)
+              {
+                  irqSet(IRQ_DMA2, chain_next);
+                  irqEnable(IRQ_DMA2);
+                  irq_set = 1;
+              }
+              if (!m->async_list || m->async_fmt != poly_fmt)
+                  model_build_async(m, poly_fmt);
+              glPushMatrix();
+              glTranslatef32(m->center[0], m->center[1], m->center[2]);
+              int s = inttof32(1 << m->shift);
+              glScalef32(s, s, s);
+              memset(anchor_of, 0, m->draw_count);
+              memset(taken, 0, m->draw_count);
+              // Forward on the ground, as a unit vector.
+              int fx = at[0] - eye[0], fz = at[2] - eye[2];
+              int len = (int)sqrt64((u64)((s64)fx * fx + (s64)fz * fz));
+              if (len == 0)
+                  len = 1;
+              fx = divf32(fx, len);
+              fz = divf32(fz, len);
+              // Sorted by distance, roughly: those that don't fit the budget are the farthest, in the haze.
+              for (int i = 0; i < NEAR_BUCKETS; i++)
+                  head[i] = -1;
+              for (int i = m->draw_count - 1; i >= 0; i--)
+              {
+                  const ModelDraw *d = &m->draws[i];
+                  int dx = d->chunk[0] - eye[0], dz = d->chunk[2] - eye[2];
+                  // (The chunk the player stands on: its floor under his feet. Never culled by the view.)
+                  int is_anchor = 0;
+                  if (anchor_on)
+                  {
+                      int ax_ = d->chunk[0] - anchor_pos[0], az_ = d->chunk[2] - anchor_pos[2], r_ = d->chunk[3];
+                      ax_ = ax_ < 0 ? -ax_ : ax_;
+                      az_ = az_ < 0 ? -az_ : az_;
+                      is_anchor = ax_ <= r_ && az_ <= r_ && anchor_pos[1] >= d->chunk[1] - r_ - ANCHOR_Y_MARGIN
+                                  && anchor_pos[1] <= d->chunk[1] + r_ + ANCHOR_Y_MARGIN;
+                  }
+                  // (Wholly behind the camera, with room to spare.)
+                  int fwd = ((s64)dx * fx + (s64)dz * fz) >> 12;
+                  if (!is_anchor && fwd < -(d->chunk[3] + BEHIND_MARGIN))
+                      continue;
+                  // (Wholly off to a side.)
+                  int lat = ((s64)dz * fx - (s64)dx * fz) >> 12;
+                  if (lat < 0)
+                      lat = -lat;
+                  if (!is_anchor && lat > mulf32(fwd > 0 ? fwd : 0, SIDE_TAN) + d->chunk[3] + SIDE_MARGIN)
+                      continue;
+                  // (The floor below, from a gallery above it.)
+                  if (cull_below && d->chunk[1] + d->chunk[3] < cull_below)
+                      continue;
+                  // (A room's inside from out of it, or the world outside from in it.)
+                  if (cull_mode)
+                  {
+                      int r = d->chunk[3];
+                      int in = d->chunk[0] - r > cull_box[0] && d->chunk[0] + r < cull_box[2] && d->chunk[2] - r > cull_box[1] && d->chunk[2] + r < cull_box[3];
+                      int out = d->chunk[0] + r < cull_box[0] || d->chunk[0] - r > cull_box[2] || d->chunk[2] + r < cull_box[1] || d->chunk[2] - r > cull_box[3];
+                      if ((cull_mode == CULL_INSIDE && in) || (cull_mode == CULL_OUTSIDE && out))
+                          continue;
+                  }
+                  anchor_of[i] = is_anchor;
+                  int ax = dx < 0 ? -dx : dx, az = dz < 0 ? -dz : dz;
+                  int b = (ax > az ? ax + az / 2 : az + ax / 2) - d->chunk[3];
+                  b = b < 0 ? 0 : b >> BUCKET_SHIFT;
+                  if (b >= NEAR_BUCKETS)
+                      b = NEAR_BUCKETS - 1;
+                  next[i] = head[b];
+                  head[b] = i;
+              }
+              int n = 0, left = budget, full = 0, anchors = 0, anchor_tris = 0;
+              // First the floor under the player, outside the budget (up to the cap).
+              for (int i = 0; i < m->draw_count; i++)
+              {
+                  if (!anchor_of[i])
+                      continue;
+                  int t = (int)m->draws[i].triangles;
+                  if (anchor_tris + t > ANCHOR_TRI_MAX && !(anchors == 0 && t <= ANCHOR_FIRST_MAX))
+                      continue;
+                  taken[i] = 1;
+                  anchors++;
+                  anchor_tris += t;
+                  left = left > t ? left - t : 0;
+                  chain_add(m, i, &n);
+              }
+              // Nearest first; once one doesn't fit, nothing farther is drawn (its own distance band is
+              // finished). Skipping just that one let smaller chunks behind it in: a big wall near the
+              // camera vanished, and the distance showed through it.
+              for (int b = 0; b < NEAR_BUCKETS && !full; b++)
+                  for (int i = head[b]; i >= 0; i = next[i])
+                  {
+                      const ModelDraw *d = &m->draws[i];
+                      if (taken[i])
+                          continue;
+                      if ((int)d->triangles > left)
+                      {
+                          full = 1;
+                          continue;
+                      }
+                      left -= d->triangles;
+                      chain_add(m, i, &n);
+                  }
+              // Last, the list's closing MTX_POP.
+              chain[n].src = m->async_list + m->async_words - 2;
+              chain[n++].words = 2;
+              chain_at = 0;
+              chain_n = n;
+              int irq = enterCriticalSection();
+              chain_next();
+              leaveCriticalSection(irq);
+          }
+
+          """
+          c = c[:a] + NEW + c[b:]
+          wr('model.c', c)
+
+          m = rd('main.c')
+          m = rep(m, "            model_draw_near(&stage, look_eye, look_at, stage_budget,", """            {
+                          int anchor[3] = { leon_pos[0], leon_feet, leon_pos[2] };
+                          model_set_anchor(anchor);   // the floor under Leon is never what the budget drops
+                      }
+                      model_draw_near(&stage, look_eye, look_at, stage_budget,""")
+          wr('main.c', m)
+          print("floor fix applied")
           RE4_EOF
           chmod +x symbian/tools/*.sh
           bash symbian/tools/prepare.sh
