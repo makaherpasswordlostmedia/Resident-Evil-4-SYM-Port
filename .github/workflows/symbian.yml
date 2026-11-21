@@ -1821,7 +1821,7 @@ jobs:
               return (a << 24) | ((r << 3 | r >> 2) << 16) | ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
           }
 
-          #define DBG_MAX_LINES 500          /* the log stays short: at most this many diagnostic lines */
+          #define DBG_MAX_LINES 1500         /* the log stays short: at most this many diagnostic lines */
           static int dbg_lines;
           int glTexImageNtr2D(GL_TEXTURE_TYPE_ENUM type, int w, int h, int param, const void *texels, const void *unused)
           {
@@ -2038,7 +2038,7 @@ jobs:
           static int gx_opt;
           static int dbg_kept, dbg_ktex, dbg_cullb, dbg_cullf, dbg_line, dbg_far, dbg_side, dbg_near, dbg_ovf, dbg_bigcull, dbg_bigkept;
           /* per-polygon detail of the "floor candidates" (wide, in the lower half of the screen), on a few frames */
-          static int dbg_on = 1, dbg_nc, dbg_nd;
+          static int dbg_on, dbg_nc, dbg_nd;        /* dbg_on: this frame is a logged sample (one in 120) */
           static int dbg_pw, dbg_pzf, dbg_pa0, dbg_pfs, dbg_pfn;
 
           typedef struct { int x, y, z, w, u, v; u8 r, g, b; } CV;
@@ -2497,6 +2497,7 @@ jobs:
                   snprintf(m, sizeof m, "first glFlush: %d polys", npoly);
                   host_log(m);
                   first = 0;
+                  dbg_on = 1;                                 /* the very first frame is a sample too */
                   FILE *of = fopen("data/gxopt.txt", "rb");
                   if (of)
                   {
@@ -2532,6 +2533,7 @@ jobs:
                   else if (dt > 55) shim_lowres = 1;
               }
               npoly = nvert = 0;
+              dbg_on = (nflush % 120) == 119;               /* the next frame is logged: about every 2 s */
           }
 
           /* ---------------------------------------------------- misc gl* and status */
