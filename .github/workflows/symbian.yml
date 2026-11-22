@@ -9,8 +9,8 @@ name: Build Symbian^3 SIS (RE4 DS)
 #   build-sis - Symbian^3 toolchain (fieldops-dev/symbian3-toolchain, macos-14 arm64 runner); the
 #               first run builds GCC (about 1.5-2 h) and caches it, later runs take minutes
 #
-# 3D: OpenGL ES 2.0 only (EGL pbuffer, shim/glesr.c; links libEGL/libGLESv2 from the SDK). There is no software
-# rasteriser in the build. The floor fix (tools/fix_floor.py) is part of this file too.
+# ONE FILE FOR EVERYTHING. Push/PR/tag = build the .sisx. Run workflow with convert=true = convert the
+# Zeebo zip into E:\RE4DS\data + nitrofs on a Windows runner (job convert-data), no PC needed.
 #
 # The .sisx contains only the program. Game data goes to E:\RE4DS\data and E:\RE4DS\nitrofs
 # (see symbian/README.md).
@@ -21,6 +21,23 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      convert:
+        description: 'Run ONLY the game-data conversion (Windows) instead of the build'
+        type: boolean
+        default: false
+      gdrive_id:
+        description: '[convert] Google Drive file ID of the Zeebo zip (shared as Anyone with the link)'
+        required: false
+        default: ''
+      zip_url:
+        description: '[convert] direct download URL of the Zeebo zip (if no gdrive_id)'
+        required: false
+        default: ''
+      release_tag:
+        description: '[convert] release tag of this repo that holds the zip (if no gdrive_id / zip_url)'
+        required: false
+        default: 'zeebo'
 
 env:
   TOOLCHAIN_REPO: fieldops-dev/symbian3-toolchain
@@ -33,6 +50,7 @@ jobs:
   sources:
     name: Write port sources
     runs-on: ubuntu-latest
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.convert) }}
     steps:
       - uses: actions/checkout@v4
       - name: Generate symbian/ tree
@@ -42,7 +60,7 @@ jobs:
           cat > symbian/README.md <<'RE4_EOF'
           # Resident Evil 4 DS port - Symbian^3 layer
 
-          The game code in `ds/source` (C, libnds) is built **unmodified except for three small patches**
+          The game code in `ds/source` (C, libnds) is built **unmodified except for two small patches**
           (`tools/prepare.sh`) on top of a software implementation of the parts of the Nintendo DS the
           game uses. Nothing here is a rewrite of the game.
 
@@ -58,9 +76,10 @@ jobs:
 
           * **GX**: matrix stacks, projection / look-at, packed command lists + DMA to the FIFO (the models'
             display lists), triangles / quads / strips, near-plane clipping, culling, 2048 polygon /
-            6144 vertex limits and the polygon-RAM counters the game's LOD logic reads, perspective-correct
-            256-colour and A5I3 textures, vertex colour, translucency (opaque pass first, then translucent),
-            depth test, fog table, clear colour. Integer maths only; the 3D buffer is 256x192.
+            6144 vertex limits and the polygon-RAM counters the game's LOD logic reads. The clipped polygons
+            go to the **GLES 2.0 renderer** (`app/src/re4ds_gl.cpp`, the only renderer - there is no software
+            rasterizer): perspective-correct 256-colour and A5I3 textures, vertex colour, translucency (opaque
+            pass first, then translucent), depth test, fog table, clear colour, all on the GPU.
           * **2D**: the 32x16 text sprites of `text.c` (incl. the 2x affine scale), the 256x256 sub-screen
             bitmap, console text, brightness fades, main/sub screen swap for cut-ins.
           * **Sound**: 8-bit and IMA-ADPCM channels (the game's SFX bank and looped music) mixed at 22.05 kHz stereo.
@@ -91,13 +110,13 @@ jobs:
 
           ## Status / known limits
 
+          * GLES 2.0 is required. If the device cannot start EGL/GLES 2 the window says so (code + `re4ds.log`) and the game is not started. The build fails if the SDK has no EGL/GLES2.
           * Written without access to a Symbian build; the CI is the first real compile of `app/` and the
             Symbian-specific bits. What *is* verified on every run (job `host-test`): the whole game
             compiles and links against the shim, a freestanding 32-bit pass with only our own libc headers,
-            and a rasterizer smoke test (perspective texture, translucency, depth).
-          * Speed is untested on hardware: the 680 MHz ARM11 renders ~2000 polygons in software. If it is too
-            slow, lower `POLY_HIGH` / `POLY_LOW` in `ds/source/main.c` (the game already adapts to them).
-          * Memory: all `data/*.bin` are read into the game thread's heap (96 MB max).
+            and a smoke test of the GX front end / GLES hand-off (textures, batches, alpha, uv).
+          * Speed is untested on hardware. The CPU only transforms/clips the polygons; the GPU draws them.
+          * Memory: all `data/*.bin` are read into the game thread's heap (the UI heap is shared with the game, 96 MB max).
           RE4_EOF
           mkdir -p symbian/app/data
           cat > symbian/app/data/re4ds.rss <<'RE4_EOF'
@@ -158,6 +177,8 @@ jobs:
           #include <fbs.h>
           #include <mdaaudiooutputstream.h>
 
+          #include "gl_iface.h"
+
           const TUid KUidRe4Ds = { (TInt32)0xE1A5B0CE };
 
           // ---- the C side (shim/) ----
@@ -169,8 +190,12 @@ jobs:
               extern volatile int shim_console_on;
               extern volatile int shim_quit;
               extern volatile int shim_pause;
-              extern volatile unsigned int shim_present_count;
-              extern volatile int shim_frameskip_enable;
+              extern volatile unsigned int shim_frame_no;
+              extern const char* volatile shim_where;
+              extern volatile unsigned int shim_ui_ticks;
+              int shim_trace_dump(char* aBuf, int aCap);
+              int shim_trace_tail(char* aBuf, int aCap, int aN);
+              void swiWaitForVBlank(void);
               void shim_set_input(unsigned aKeys, int aTouchDown, int aX, int aY);
               int shim_audio_mix(short* aStereo, int aFrames);
               int shim_load_databins(void);
@@ -181,6 +206,8 @@ jobs:
 
           // ---- host services (re4ds_host.cpp) ----
           void Re4Log(const char* aFmt, ...);   // appends a line to E:\\RE4DS\\re4ds.log (any thread)
+          void Re4StartWatchdog(TThreadId aUi, TThreadId aGame);
+          void Re4StopWatchdog();
           void Re4HostInitL();            // UI thread: lock + file root
           void Re4HostShutdown();
           TInt Re4GameThread(TAny*);      // the game's thread
@@ -217,6 +244,64 @@ jobs:
               TBuf8<KBytes> iSlot[KSlots];
               };
 
+          // GLES 2.0 renderer (re4ds_gl.cpp). The only renderer: if the device cannot bring EGL/GLES 2.0 up,
+          // the window says so and the game does not start.
+          class CRe4Gl : public CBase
+              {
+          public:
+              static CRe4Gl* NewL(RWindow& aWindow);     // leaves with KErrNotSupported when GLES 2 is not usable
+              ~CRe4Gl();
+              void Render();                             // one frame (UI thread only)
+
+          private:
+              void ConstructL(RWindow& aWindow);
+              void InitEgl(RWindow& aWindow);
+              void InitGl();
+              void Teardown(TBool aKeepTextures);
+              void Recover();
+              void PumpTextures();
+              void CreateGlTex(TInt aId);
+              void FreeTex(TInt aId);
+              void UploadScreens();
+              void DrawGeo(const ShimGlGeo& aGeo);
+              void DrawTexQuad(TUint aTex, TBool aBlend);
+              void DrawSolid(TInt aLevel);               // black (<0 fade) / white (>0) overlay, |level| / 16
+
+              enum { KMaxTex = 640 };
+              struct TTex
+                  {
+                  TUint iName;
+                  TUint32* iPx;
+                  TInt iW, iH, iWrapS, iWrapT;
+                  };
+              RWindow* iWin;
+              void* iDisplay;
+              void* iSurface;
+              void* iContext;
+              void* iConfig;
+              TBool iOk;
+              TInt iW, iH;
+              TUint iProgGeo, iProg2d, iTexOverlay, iTexBot, iTexFog;
+              TInt iGeoU[6];
+              TInt iFlatU[3];
+              TUint32* iBuf;
+              TUint32 iLastFogSeq;
+              TTex iTex[KMaxTex];
+              };
+
+          // Child window the GLES surface is attached to (parent keeps the buttons); forwards touches.
+          class CRe4Container;
+          class CRe4GlWin : public CCoeControl
+              {
+          public:
+              void ConstructL(CRe4Container& aParent);
+              RWindow& Win() const { return Window(); }
+              void Draw(const TRect&) const {}
+              void HandlePointerEventL(const TPointerEvent& aEvent);
+          private:
+              CRe4Container* iParent;
+              };
+
           // Main control: both DS screens, touch pad, buttons.
           class CRe4Container : public CCoeControl
               {
@@ -227,38 +312,43 @@ jobs:
 
               void Draw(const TRect& aRect) const;
               void SizeChanged();
+              TInt CountComponentControls() const;
+              CCoeControl* ComponentControl(TInt aIndex) const;
               void HandlePointerEventL(const TPointerEvent& aEvent);
               TKeyResponse OfferKeyEventL(const TKeyEvent& aKeyEvent, TEventCode aType);
 
           private:
-              enum { KButtons = 9 };
+              enum { KButtons = 13 };
               CRe4Container();
               void ConstructL();
               static TInt TickCb(TAny* aPtr);
               void Tick();
               void ComputeLayout();
               void PushInput();
-              void Recompute();
+              void ApplyPoint(const TPoint& aPt);
               TUint ButtonsAt(const TPoint& aPt) const;
               void DrawButton(CWindowGc& aGc, const TRect& aRect, const TDesC& aLabel, TBool aDown) const;
               void DrawConsole(CWindowGc& aGc) const;
+              void DrawFailure(CWindowGc& aGc) const;
 
-              CFbsBitmap* iTop;
-              CFbsBitmap* iBot;
+              CRe4GlWin* iGlWin;
+              CRe4Gl* iGl;
+              TBool iGlVisible;
+              TBool iBackground;
+              TBool iDirty;
+              TRect iGlRect;
+              TBool iGlFailed;        // GLES 2.0 could not start: the window shows why, the game is not started
+              TInt iGlErr;
               CPeriodic* iTimer;
               CRe4Audio* iAudio;
               RThread iGame;
               TBool iGameStarted;
-              TBool iDeathLogged;
 
               TUint iKeyBits;       // hardware keys
               TUint iPadBits;       // on-screen buttons
               TBool iTouch;
               TInt iTouchX, iTouchY;
               TInt iQuitTick;
-              enum { KMaxPtr = 5 };
-              TBool iPtrDown[KMaxPtr];        // multi-touch: one slot per finger
-              TPoint iPtrPos[KMaxPtr];
 
               TRect iTopRect, iBotRect;
               TPoint iDpadC;
@@ -373,6 +463,7 @@ jobs:
 
           void CRe4AppUi::HandleForegroundEventL(TBool aForeground)
               {
+              Re4Log("foreground event: %d", (TInt)aForeground);
               CAknAppUi::HandleForegroundEventL(aForeground);
               if (iContainer)
                   {
@@ -510,9 +601,10 @@ jobs:
           #include <eikenv.h>
           #include <eikappui.h>
           #include <w32std.h>
+          #include <hal.h>
           #include "re4ds.h"
 
-          static const TInt KFrameMicros = 33333;      // UI refresh (the game itself runs at 60 Hz)
+          static const TInt KFrameMicros = 16667;      // GL refresh (the game itself runs at 60 Hz)
 
           _LIT(KLblL, "L");
           _LIT(KLblR, "R");
@@ -523,9 +615,14 @@ jobs:
           _LIT(KLblX, "X");
           _LIT(KLblY, "Y");
           _LIT(KLblQuit, "QUIT");
+          _LIT(KLblUp, "UP");
+          _LIT(KLblDown, "DN");
+          _LIT(KLblLeft, "<");
+          _LIT(KLblRight, ">");
 
-          // button slots: 0 L, 1 R, 2 SELECT, 3 START, 4 A, 5 B, 6 X, 7 Y, 8 QUIT
-          static const TUint KBtnBits[9] = { KDsL, KDsR, KDsSelect, KDsStart, KDsA, KDsB, KDsX, KDsY, 0 };
+          // button slots: 0 L, 1 R, 2 SELECT, 3 START, 4 A, 5 B, 6 X, 7 Y, 8 QUIT, 9 UP, 10 DOWN, 11 LEFT, 12 RIGHT
+          static const TUint KBtnBits[13] = { KDsL, KDsR, KDsSelect, KDsStart, KDsA, KDsB, KDsX, KDsY, 0,
+                                              KDsUp, KDsDown, KDsLeft, KDsRight };
 
           CRe4Container* CRe4Container::NewL(const TRect& /*aRect*/)
               {
@@ -548,6 +645,7 @@ jobs:
                   delete iTimer;
                   }
               // let the game save and leave cleanly
+              Re4Log("container: shutting down");
               shim_quit = 1;
               shim_pause = 0;
               if (iGameStarted)
@@ -562,9 +660,10 @@ jobs:
                       }
                   iGame.Close();
                   }
+              Re4StopWatchdog();
               delete iAudio;
-              delete iTop;
-              delete iBot;
+              delete iGl;
+              delete iGlWin;
               Re4HostShutdown();
               }
 
@@ -572,18 +671,8 @@ jobs:
               {
               CreateWindowL();
               SetExtentToWholeScreen();
-              Window().EnableAdvancedPointers();      // several fingers at once (pointer numbers on the events)
               EnableDragEvents();
               SetFocusing(ETrue);
-
-              iTop = new (ELeave) CFbsBitmap;
-              TInt berr = iTop->Create(TSize(256, 192), EColor16MU);
-              Re4Log("container: top bitmap %d", berr);
-              User::LeaveIfError(berr);
-              iBot = new (ELeave) CFbsBitmap;
-              berr = iBot->Create(TSize(256, 192), EColor16MU);
-              Re4Log("container: bottom bitmap %d", berr);
-              User::LeaveIfError(berr);
 
               Re4HostInitL();
               TRAPD(aerr, iAudio = CRe4Audio::NewL());
@@ -593,23 +682,86 @@ jobs:
                   }
               Re4Log("container: audio %d", aerr);
 
-              // the game: own thread, own heap (96 MB max), 512 KB stack
-              TInt err = iGame.Create(_L("re4ds_game"), Re4GameThread, 0x80000, 0x200000, 0x6000000,
-                                      NULL, EOwnerProcess);
+              ComputeLayout();
+
+              // GLES 2.0 is the only renderer: a child window carries the EGL surface
+              TRAPD(cerr, iGlWin = new (ELeave) CRe4GlWin; iGlWin->ConstructL(*this); iGlWin->SetRect(iGlRect));
+              iGlErr = cerr;
+              if (cerr != KErrNone)
+                  {
+                  Re4Log("container: gl window %d", cerr);
+                  delete iGlWin;
+                  iGlWin = NULL;
+                  }
+              iGlVisible = ETrue;
+              ActivateL();
+              if (iGlWin)
+                  {
+                  TRAPD(gerr, iGl = CRe4Gl::NewL(iGlWin->Win()));
+                  iGlErr = gerr;
+                  if (gerr != KErrNone || !iGl || !shim_gl_enable())
+                      {
+                      if (gerr == KErrNone)
+                          {
+                          iGlErr = KErrNoMemory;
+                          }
+                      delete iGl;
+                      iGl = NULL;
+                      delete iGlWin;
+                      iGlWin = NULL;
+                      }
+                  }
+              if (!iGl)
+                  {
+                  iGlFailed = ETrue;
+                  Re4Log("container: GLES 2.0 could not start (error %d) - the game is NOT started", iGlErr);
+                  DrawNow();
+                  return;
+                  }
+              Re4Log("container: renderer = GLES 2.0");
+
+              // the game: own thread, 512 KB stack, sharing the UI heap (textures are handed to the GL side
+              // and freed there; the heap max is EPOCHEAPSIZE in the .mmp)
+              TInt err = iGame.Create(_L("re4ds_game"), Re4GameThread, 0x80000, NULL, EOwnerProcess);
               Re4Log("container: game thread create %d", err);
               User::LeaveIfError(err);
-              iGame.SetPriority(EPriorityNormal);
+              iGame.SetPriority(EPriorityLess);      // the UI thread always wins
               iGame.Resume();
               iGameStarted = ETrue;
+              Re4StartWatchdog(RThread().Id(), iGame.Id());
 
-              ComputeLayout();
               iTimer = CPeriodic::NewL(CActive::EPriorityStandard);
               iTimer->Start(KFrameMicros, KFrameMicros, TCallBack(TickCb, this));
-              ActivateL();
+              }
+
+          TInt CRe4Container::CountComponentControls() const
+              {
+              return iGlWin ? 1 : 0;
+              }
+
+          CCoeControl* CRe4Container::ComponentControl(TInt) const
+              {
+              return iGlWin;
+              }
+
+          void CRe4GlWin::ConstructL(CRe4Container& aParent)
+              {
+              iParent = &aParent;
+              CreateWindowL(&aParent);
+              EnableDragEvents();
+              }
+
+          void CRe4GlWin::HandlePointerEventL(const TPointerEvent& aEvent)
+              {
+              TPointerEvent e = aEvent;                 // child coordinates -> container coordinates
+              e.iPosition += Position();
+              iParent->HandlePointerEventL(e);
               }
 
           void CRe4Container::SetForeground(TBool aForeground)
               {
+              iBackground = !aForeground;
+              iDirty = ETrue;
               shim_pause = aForeground ? 0 : 1;
               if (iAudio)
                   {
@@ -627,10 +779,6 @@ jobs:
                   iKeyBits = 0;
                   iPadBits = 0;
                   iTouch = EFalse;
-                  for (TInt i = 0; i < KMaxPtr; ++i)
-                      {
-                      iPtrDown[i] = EFalse;
-                      }
                   PushInput();
                   }
               }
@@ -643,40 +791,36 @@ jobs:
 
           void CRe4Container::Tick()
               {
-              if (iGameStarted && !iDeathLogged && iGame.ExitType() != EExitPending)
-                  {
-                  iDeathLogged = ETrue;
-                  TExitCategoryName cat = iGame.ExitCategory();
-                  TBuf8<KMaxExitCategoryName> cat8;
-                  cat8.Copy(cat);
-                  cat8.ZeroTerminate();
-                  Re4Log("GAME THREAD DIED: type=%d reason=%d category=%s", (TInt)iGame.ExitType(),
-                         iGame.ExitReason(), (const char*)cat8.Ptr());
-                  }
-              // redraw only when the game presented a new picture or the pad changed (the window server is the slow part)
-              static unsigned lastPresent = 0xFFFFFFFFu;
-              static TUint lastHeld = 0xFFFFFFFFu;
-              TUint heldNow = iKeyBits | iPadBits;
-              if (lastPresent == shim_present_count && lastHeld == heldNow)
+              ++shim_ui_ticks;
+              if (!iGl)
                   {
                   return;
                   }
-              lastPresent = shim_present_count;
-              lastHeld = heldNow;
-              host_lock();
-              iTop->LockHeap();
-              Mem::Copy(iTop->DataAddress(), shim_top, 256 * 192 * 4);
-              iTop->UnlockHeap();
-              iBot->LockHeap();
-              Mem::Copy(iBot->DataAddress(), shim_bot, 256 * 192 * 4);
-              iBot->UnlockHeap();
-              host_unlock();
-              DrawNow();
+              const TBool wantGl = !shim_console_on;      // the error console is drawn by the window itself
+              if (iGlWin && wantGl != iGlVisible)
+                  {
+                  iGlWin->MakeVisible(wantGl);
+                  iGlVisible = wantGl;
+                  iDirty = ETrue;
+                  }
+              if (!iBackground && iGlVisible)
+                  {
+                  iGl->Render();
+                  }
+              if (iDirty)
+                  {
+                  iDirty = EFalse;
+                  DrawNow();
+                  }
               }
 
           void CRe4Container::SizeChanged()
               {
               ComputeLayout();
+              if (iGlWin)
+                  {
+                  iGlWin->SetRect(iGlRect);
+                  }
               }
 
           void CRe4Container::ComputeLayout()
@@ -696,6 +840,7 @@ jobs:
                   sw = sh * 4 / 3;
                   }
               TInt x0 = (w - 2 * sw) / 2;
+              iGlRect = TRect(x0, 0, x0 + 2 * sw, sh);
               iTopRect = TRect(x0, 0, x0 + sw, sh);
               iBotRect = TRect(x0 + sw, 0, x0 + 2 * sw, sh);
 
@@ -710,35 +855,30 @@ jobs:
               iBtn[6] = TRect(fx - bs / 2, cy - bs / 2 - bs + 4, fx + bs / 2, cy - bs / 2 + 4);       // X top
               iBtn[7] = TRect(fx - bs / 2 - bs, cy - bs / 2, fx - bs / 2, cy + bs / 2);                // Y left
               TInt mx = w / 2;
-              TInt cw = w / 9, ch = h / 8;                                                            // shoulder buttons: top corners
-              iBtn[0] = TRect(0, 0, cw, ch);                                                           // L
-              iBtn[1] = TRect(w - cw, 0, w, ch);                                                       // R
+              iBtn[0] = TRect(mx - 150, sh + 6, mx - 80, sh + 6 + hs / 3);                             // L
+              iBtn[1] = TRect(mx + 80, sh + 6, mx + 150, sh + 6 + hs / 3);                             // R
               iBtn[2] = TRect(mx - 70, cy - hs / 6, mx - 5, cy + hs / 6);                              // SELECT
               iBtn[3] = TRect(mx + 5, cy - hs / 6, mx + 70, cy + hs / 6);                              // START
               iBtn[8] = TRect(mx - 40, h - hs / 3 - 2, mx + 40, h - 2);                                // QUIT
+              TInt dx = iDpadC.iX;
+              iBtn[9] = TRect(dx - bs / 2, cy - bs - bs / 2, dx + bs / 2, cy - bs / 2);                // UP
+              iBtn[10] = TRect(dx - bs / 2, cy + bs / 2, dx + bs / 2, cy + bs + bs / 2);               // DOWN
+              iBtn[11] = TRect(dx - bs - bs / 2, cy - bs / 2, dx - bs / 2, cy + bs / 2);               // LEFT
+              iBtn[12] = TRect(dx + bs / 2, cy - bs / 2, dx + bs + bs / 2, cy + bs / 2);               // RIGHT
               }
 
           void CRe4Container::PushInput()
               {
+              iDirty = ETrue;
               shim_set_input(iKeyBits | iPadBits, iTouch, iTouchX, iTouchY);
               }
 
           TUint CRe4Container::ButtonsAt(const TPoint& aPt) const
               {
               TUint bits = 0;
-              TInt dx = aPt.iX - iDpadC.iX, dy = aPt.iY - iDpadC.iY;
-              TInt lim = iDpadR + iDpadR / 3;
-              if (dx * dx + dy * dy <= lim * lim && dx * dx + dy * dy >= (iDpadR / 5) * (iDpadR / 5))
+              for (TInt i = 0; i < KButtons; ++i)
                   {
-                  TInt t = iDpadR / 3;
-                  if (dx < -t) bits |= KDsLeft;
-                  if (dx > t) bits |= KDsRight;
-                  if (dy < -t) bits |= KDsUp;
-                  if (dy > t) bits |= KDsDown;
-                  }
-              for (TInt i = 0; i < 8; ++i)
-                  {
-                  if (iBtn[i].Contains(aPt))
+                  if (i != 8 && iBtn[i].Contains(aPt))
                       {
                       bits |= KBtnBits[i];
                       }
@@ -746,47 +886,29 @@ jobs:
               return bits;
               }
 
-          void CRe4Container::Recompute()
+          void CRe4Container::ApplyPoint(const TPoint& aPt)
               {
-              // every finger that is down counts: the buttons / pad under any of them are held (so Y + a pad
-              // direction + the bottom screen work together); the first finger on the bottom screen is the stylus.
-              TUint pad = 0;
-              TBool touch = EFalse;
-              for (TInt i = 0; i < KMaxPtr; ++i)
+              if (iBotRect.Contains(aPt))
                   {
-                  if (!iPtrDown[i])
-                      {
-                      continue;
-                      }
-                  const TPoint& pt = iPtrPos[i];
-                  if (iBotRect.Contains(pt) && !iBtn[0].Contains(pt) && !iBtn[1].Contains(pt))
-                      {
-                      if (!touch)
-                          {
-                          touch = ETrue;
-                          iTouchX = (pt.iX - iBotRect.iTl.iX) * 256 / iBotRect.Width();
-                          iTouchY = (pt.iY - iBotRect.iTl.iY) * 192 / iBotRect.Height();
-                          }
-                      }
-                  else
-                      {
-                      pad |= ButtonsAt(pt);
-                      }
+                  iTouch = ETrue;
+                  iTouchX = (aPt.iX - iBotRect.iTl.iX) * 256 / iBotRect.Width();
+                  iTouchY = (aPt.iY - iBotRect.iTl.iY) * 192 / iBotRect.Height();
+                  iPadBits = 0;
                   }
-              iTouch = touch;
-              iPadBits = pad;
+              else
+                  {
+                  iTouch = EFalse;
+                  iPadBits = ButtonsAt(aPt);
+                  }
               }
 
           void CRe4Container::HandlePointerEventL(const TPointerEvent& aEvent)
               {
-              TInt n = 0;
-              if (aEvent.IsAdvancedPointerEvent())
+              static TInt logged = 0;
+              if (aEvent.iType != TPointerEvent::EDrag && logged < 400)
                   {
-                  n = aEvent.AdvancedPointerEvent()->PointerNumber();
-                  }
-              if (n < 0 || n >= KMaxPtr)
-                  {
-                  return;
+                  ++logged;
+                  Re4Log("pointer type=%d at %d,%d", (TInt)aEvent.iType, aEvent.iPosition.iX, aEvent.iPosition.iY);
                   }
               switch (aEvent.iType)
                   {
@@ -801,22 +923,18 @@ jobs:
                               }
                           iQuitTick = now ? now : 1;
                           }
-                      iPtrDown[n] = ETrue;
-                      iPtrPos[n] = aEvent.iPosition;
+                      ApplyPoint(aEvent.iPosition);
                       break;
                   case TPointerEvent::EDrag:
-                      if (iPtrDown[n])
-                          {
-                          iPtrPos[n] = aEvent.iPosition;
-                          }
+                      ApplyPoint(aEvent.iPosition);
                       break;
                   case TPointerEvent::EButton1Up:
-                      iPtrDown[n] = EFalse;
+                      iTouch = EFalse;
+                      iPadBits = 0;
                       break;
                   default:
                       break;
                   }
-              Recompute();
               PushInput();
               }
 
@@ -841,6 +959,12 @@ jobs:
                   case EStdKeySpace:      bit = KDsStart; break;
                   case 'E':               bit = KDsSelect; break;
                   default:                break;
+                  }
+              static TInt keysLogged = 0;
+              if (aType != EEventKey && keysLogged < 400)
+                  {
+                  ++keysLogged;
+                  Re4Log("key type=%d scan=%d", (TInt)aType, (TInt)aKey.iScanCode);
                   }
               if (!bit)
                   {
@@ -872,6 +996,26 @@ jobs:
               aGc.DiscardFont();
               }
 
+          void CRe4Container::DrawFailure(CWindowGc& aGc) const
+              {
+              aGc.SetPenStyle(CGraphicsContext::ESolidPen);
+              aGc.SetPenColor(KRgbWhite);
+              const CFont* font = iEikonEnv->NormalFont();
+              aGc.UseFont(font);
+              const TInt lineH = font->HeightInPixels() + 4;
+              TInt y = font->AscentInPixels() + 8;
+              TBuf<80> line;
+              aGc.DrawText(_L("OpenGL ES 2.0 could not be started."), TPoint(8, y));
+              y += lineH;
+              line.Format(_L("Error code: %d"), iGlErr);
+              aGc.DrawText(line, TPoint(8, y));
+              y += lineH;
+              aGc.DrawText(_L("This version has no software renderer."), TPoint(8, y));
+              y += lineH;
+              aGc.DrawText(_L("Details: E:\\RE4DS\\re4ds.log"), TPoint(8, y));
+              aGc.DiscardFont();
+              }
+
           void CRe4Container::DrawConsole(CWindowGc& aGc) const
               {
               aGc.SetBrushStyle(CGraphicsContext::ESolidBrush);
@@ -883,8 +1027,11 @@ jobs:
               aGc.UseFont(font);
               TInt lineH = font->HeightInPixels() + 2;
               TInt y = iBotRect.iTl.iY + font->AscentInPixels() + 2;
-              TInt cols = iBotRect.Width() / 8;
+              TInt cw = font->MaxNormalCharWidthInPixels();
+              if (cw < 4) cw = 8;
+              TInt cols = iBotRect.Width() / cw;
               if (cols > 60) cols = 60;
+              if (cols < 8) cols = 8;
               TBuf<64> line;
               const char* p = shim_console;
               while (*p && y < iBotRect.iBr.iY)
@@ -911,29 +1058,16 @@ jobs:
               gc.SetBrushStyle(CGraphicsContext::ESolidBrush);
               gc.SetBrushColor(KRgbBlack);
               gc.Clear();
-              gc.DrawBitmap(iTopRect, iTop);
-              if (shim_console_on)
+              if (iGlFailed)
+                  {
+                  DrawFailure(gc);
+                  }
+              else if (shim_console_on)
                   {
                   DrawConsole(gc);
                   }
-              else
-                  {
-                  gc.DrawBitmap(iBotRect, iBot);
-                  }
 
-              // D-pad
               TUint held = iKeyBits | iPadBits;
-              gc.SetPenStyle(CGraphicsContext::ESolidPen);
-              gc.SetPenColor(TRgb(200, 200, 200));
-              gc.SetBrushColor(TRgb(30, 30, 36));
-              gc.DrawEllipse(TRect(iDpadC.iX - iDpadR, iDpadC.iY - iDpadR, iDpadC.iX + iDpadR, iDpadC.iY + iDpadR));
-              TInt t = iDpadR / 3;
-              gc.SetBrushColor(TRgb(120, 120, 140));
-              if (held & KDsUp)    gc.DrawRect(TRect(iDpadC.iX - t, iDpadC.iY - iDpadR, iDpadC.iX + t, iDpadC.iY - t));
-              if (held & KDsDown)  gc.DrawRect(TRect(iDpadC.iX - t, iDpadC.iY + t, iDpadC.iX + t, iDpadC.iY + iDpadR));
-              if (held & KDsLeft)  gc.DrawRect(TRect(iDpadC.iX - iDpadR, iDpadC.iY - t, iDpadC.iX - t, iDpadC.iY + t));
-              if (held & KDsRight) gc.DrawRect(TRect(iDpadC.iX + t, iDpadC.iY - t, iDpadC.iX + iDpadR, iDpadC.iY + t));
-
               DrawButton(gc, iBtn[0], KLblL, held & KDsL);
               DrawButton(gc, iBtn[1], KLblR, held & KDsR);
               DrawButton(gc, iBtn[2], KLblSel, held & KDsSelect);
@@ -943,7 +1077,571 @@ jobs:
               DrawButton(gc, iBtn[6], KLblX, held & KDsX);
               DrawButton(gc, iBtn[7], KLblY, held & KDsY);
               DrawButton(gc, iBtn[8], KLblQuit, EFalse);
+              DrawButton(gc, iBtn[9], KLblUp, held & KDsUp);
+              DrawButton(gc, iBtn[10], KLblDown, held & KDsDown);
+              DrawButton(gc, iBtn[11], KLblLeft, held & KDsLeft);
+              DrawButton(gc, iBtn[12], KLblRight, held & KDsRight);
               }
+          RE4_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/re4ds_gl.cpp <<'RE4_EOF'
+          // GLES 2.0 renderer: draws the polygon batches the software DS layer prepared (clip-space
+          // triangles, perspective-correct on the GPU), plus the sprite layer, the sub screen and the
+          // fades. This is the only renderer: every failure makes NewL leave and the window reports it.
+          #include <e32base.h>
+          #include <e32std.h>
+          #include <w32std.h>
+          #include "re4ds.h"
+
+          #if !(defined(RE4_GLES2) && __has_include(<GLES2/gl2.h>) && __has_include(<EGL/egl.h>))
+          #error "RE4 DS needs EGL + OpenGL ES 2.0 (RE4_GLES2 and the SDK headers / libs) - there is no software renderer"
+          #endif
+          #include <EGL/egl.h>
+          #include <GLES2/gl2.h>
+          #ifndef EGL_OPENGL_ES2_BIT
+          #define EGL_OPENGL_ES2_BIT 0x0004
+          #endif
+          #ifndef EGL_CONTEXT_CLIENT_VERSION
+          #define EGL_CONTEXT_CLIENT_VERSION 0x3098
+          #endif
+
+          // ------------------------------------------------------------------ shaders
+          static const char KVsGeo[] =
+              "attribute vec4 aPos;\n"
+              "attribute vec2 aUV;\n"
+              "attribute vec4 aCol;\n"
+              "varying vec4 vCol;\n"
+              "varying vec2 vUV;\n"
+              "void main(){ gl_Position = aPos; vCol = aCol; vUV = aUV; }\n";
+
+          static const char KFsGeo[] =
+              "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+              "precision highp float;\n"
+              "#else\n"
+              "precision mediump float;\n"
+              "#endif\n"
+              "varying vec4 vCol;\n"
+              "varying vec2 vUV;\n"
+              "uniform sampler2D uTex;\n"
+              "uniform sampler2D uFog;\n"
+              "uniform vec4 uFogCol;\n"
+              "uniform float uUseTex;\n"
+              "uniform float uUseFog;\n"
+              "uniform float uCut;\n"
+              "void main(){\n"
+              "  vec4 c = vCol;\n"
+              "  if (uUseTex > 0.5) {\n"
+              "    vec4 t = texture2D(uTex, vUV);\n"
+              "    if (t.a < uCut) discard;\n"
+              "    c.rgb *= t.rgb;\n"
+              "    c.a *= t.a;\n"
+              "  } else if (c.a < 0.004) discard;\n"
+              "  if (uUseFog > 0.5) {\n"
+              "    float d = texture2D(uFog, vec2(gl_FragCoord.z, 0.5)).r;\n"
+              "    c.rgb = mix(c.rgb, uFogCol.rgb, d);\n"
+              "  }\n"
+              "  gl_FragColor = c;\n"
+              "}\n";
+
+          static const char KVs2d[] =
+              "attribute vec2 aPos;\n"
+              "attribute vec2 aUV;\n"
+              "varying vec2 vUV;\n"
+              "void main(){ gl_Position = vec4(aPos, 0.0, 1.0); vUV = aUV; }\n";
+
+          static const char KFs2d[] =
+              "precision mediump float;\n"
+              "varying vec2 vUV;\n"
+              "uniform sampler2D uTex;\n"
+              "uniform vec4 uColor;\n"
+              "uniform float uUseTex;\n"
+              "void main(){ gl_FragColor = (uUseTex > 0.5) ? texture2D(uTex, vUV) : uColor; }\n";
+
+          static const GLfloat KQuadPos[8] = { -1.f, 1.f, 1.f, 1.f, -1.f, -1.f, 1.f, -1.f };   // strip: TL TR BL BR
+          static const GLfloat KQuadUv[8] = { 0.f, 0.f, 1.f, 0.f, 0.f, 1.f, 1.f, 1.f };
+
+          static GLuint CompileShader(GLenum aType, const char* aSrc)
+              {
+              GLuint s = glCreateShader(aType);
+              glShaderSource(s, 1, &aSrc, NULL);
+              glCompileShader(s);
+              GLint ok = 0;
+              glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+              if (!ok)
+                  {
+                  char log[200];
+                  GLsizei n = 0;
+                  glGetShaderInfoLog(s, sizeof(log) - 1, &n, log);
+                  log[n] = 0;
+                  Re4Log("GLSL compile failed: %s", log);
+                  glDeleteShader(s);
+                  return 0;
+                  }
+              return s;
+              }
+
+          // attribute i is bound to aNames[i]
+          static GLuint LinkProgram(const char* aVs, const char* aFs, const char* const* aNames, TInt aCount)
+              {
+              GLuint vs = CompileShader(GL_VERTEX_SHADER, aVs);
+              GLuint fs = CompileShader(GL_FRAGMENT_SHADER, aFs);
+              if (!vs || !fs)
+                  {
+                  return 0;
+                  }
+              GLuint p = glCreateProgram();
+              glAttachShader(p, vs);
+              glAttachShader(p, fs);
+              for (TInt i = 0; i < aCount; ++i)
+                  {
+                  glBindAttribLocation(p, i, aNames[i]);
+                  }
+              glLinkProgram(p);
+              GLint ok = 0;
+              glGetProgramiv(p, GL_LINK_STATUS, &ok);
+              glDeleteShader(vs);
+              glDeleteShader(fs);
+              if (!ok)
+                  {
+                  Re4Log("GLSL link failed");
+                  glDeleteProgram(p);
+                  return 0;
+                  }
+              return p;
+              }
+
+          static void SwapRB(TUint32* aPx, TInt aCount)       // 0xAARRGGBB -> bytes R,G,B,A in memory
+              {
+              for (TInt i = 0; i < aCount; ++i)
+                  {
+                  TUint32 c = aPx[i];
+                  aPx[i] = (c & 0xFF00FF00u) | ((c >> 16) & 0xFFu) | ((c & 0xFFu) << 16);
+                  }
+              }
+
+          // ------------------------------------------------------------------ setup
+          CRe4Gl* CRe4Gl::NewL(RWindow& aWindow)
+              {
+              CRe4Gl* self = new (ELeave) CRe4Gl;
+              CleanupStack::PushL(self);
+              self->ConstructL(aWindow);
+              CleanupStack::Pop(self);
+              return self;
+              }
+
+          void CRe4Gl::ConstructL(RWindow& aWindow)
+              {
+              iWin = &aWindow;
+              iBuf = (TUint32*)User::AllocL(256 * 192 * 4);
+              InitEgl(aWindow);
+              InitGl();
+              iOk = ETrue;
+              Re4Log("gles: ready %d x %d", iW, iH);
+              }
+
+          CRe4Gl::~CRe4Gl()
+              {
+              Teardown(EFalse);
+              User::Free(iBuf);
+              }
+
+          void CRe4Gl::InitEgl(RWindow& aWindow)
+              {
+              EGLDisplay d = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+              if (d == EGL_NO_DISPLAY)
+                  {
+                  Re4Log("gles: no EGL display");
+                  User::Leave(KErrNotSupported);
+                  }
+              EGLint maj = 0, min = 0;
+              if (!eglInitialize(d, &maj, &min))
+                  {
+                  Re4Log("gles: eglInitialize failed %x", (unsigned)eglGetError());
+                  User::Leave(KErrNotSupported);
+                  }
+              iDisplay = d;
+              eglBindAPI(EGL_OPENGL_ES_API);
+
+              static const EGLint attrA[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                                              EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_DEPTH_SIZE, 16, EGL_NONE };
+              static const EGLint attrB[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                                              EGL_RED_SIZE, 5, EGL_GREEN_SIZE, 6, EGL_BLUE_SIZE, 5, EGL_DEPTH_SIZE, 16, EGL_NONE };
+              static const EGLint attrC[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                                              EGL_DEPTH_SIZE, 16, EGL_NONE };
+              const EGLint* sets[3] = { attrA, attrB, attrC };
+              EGLConfig cfg = NULL;
+              EGLint n = 0;
+              TBool found = EFalse;
+              for (TInt i = 0; i < 3 && !found; ++i)
+                  {
+                  n = 0;
+                  if (eglChooseConfig(d, sets[i], &cfg, 1, &n) && n > 0)
+                      {
+                      found = ETrue;
+                      }
+                  }
+              if (!found)
+                  {
+                  Re4Log("gles: no ES2 window config");
+                  User::Leave(KErrNotSupported);
+                  }
+              iConfig = cfg;
+              EGLSurface surf = eglCreateWindowSurface(d, cfg, &aWindow, NULL);
+              if (surf == EGL_NO_SURFACE)
+                  {
+                  Re4Log("gles: eglCreateWindowSurface failed %x", (unsigned)eglGetError());
+                  User::Leave(KErrNotSupported);
+                  }
+              iSurface = surf;
+              static const EGLint ctxAttr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+              EGLContext ctx = eglCreateContext(d, cfg, EGL_NO_CONTEXT, ctxAttr);
+              if (ctx == EGL_NO_CONTEXT)
+                  {
+                  Re4Log("gles: eglCreateContext failed %x", (unsigned)eglGetError());
+                  User::Leave(KErrNotSupported);
+                  }
+              iContext = ctx;
+              if (!eglMakeCurrent(d, surf, surf, ctx))
+                  {
+                  Re4Log("gles: eglMakeCurrent failed %x", (unsigned)eglGetError());
+                  User::Leave(KErrNotSupported);
+                  }
+              eglSwapInterval(d, 1);
+              TSize sz = aWindow.Size();
+              iW = sz.iWidth;
+              iH = sz.iHeight;
+              Re4Log("gles: EGL %d.%d, window %d x %d, vendor %s", (TInt)maj, (TInt)min, iW, iH,
+                     (const char*)glGetString(GL_RENDERER));
+              }
+
+          void CRe4Gl::InitGl()
+              {
+              static const char* const geoAttr[3] = { "aPos", "aUV", "aCol" };
+              static const char* const flatAttr[2] = { "aPos", "aUV" };
+              iProgGeo = LinkProgram(KVsGeo, KFsGeo, geoAttr, 3);
+              iProg2d = LinkProgram(KVs2d, KFs2d, flatAttr, 2);
+              if (!iProgGeo || !iProg2d)
+                  {
+                  User::Leave(KErrNotSupported);
+                  }
+              iGeoU[0] = glGetUniformLocation(iProgGeo, "uTex");
+              iGeoU[1] = glGetUniformLocation(iProgGeo, "uFog");
+              iGeoU[2] = glGetUniformLocation(iProgGeo, "uFogCol");
+              iGeoU[3] = glGetUniformLocation(iProgGeo, "uUseTex");
+              iGeoU[4] = glGetUniformLocation(iProgGeo, "uUseFog");
+              iGeoU[5] = glGetUniformLocation(iProgGeo, "uCut");
+              iFlatU[0] = glGetUniformLocation(iProg2d, "uTex");
+              iFlatU[1] = glGetUniformLocation(iProg2d, "uColor");
+              iFlatU[2] = glGetUniformLocation(iProg2d, "uUseTex");
+
+              glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+              GLuint t[3];
+              glGenTextures(3, t);
+              iTexOverlay = t[0];
+              iTexBot = t[1];
+              iTexFog = t[2];
+              for (TInt i = 0; i < 2; ++i)
+                  {
+                  glBindTexture(GL_TEXTURE_2D, i == 0 ? iTexOverlay : iTexBot);
+                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+                  }
+              glBindTexture(GL_TEXTURE_2D, iTexFog);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, 512, 1, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, NULL);
+              iLastFogSeq = 0;
+              glDisable(GL_CULL_FACE);          // culling was already done by the DS layer
+              glDisable(GL_DITHER);
+              }
+
+          void CRe4Gl::Teardown(TBool aKeepTextures)
+              {
+              EGLDisplay d = (EGLDisplay)iDisplay;
+              if (d)
+                  {
+                  eglMakeCurrent(d, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                  if (iContext) eglDestroyContext(d, (EGLContext)iContext);
+                  if (iSurface) eglDestroySurface(d, (EGLSurface)iSurface);
+                  eglTerminate(d);
+                  }
+              iDisplay = iSurface = iContext = iConfig = NULL;
+              iProgGeo = iProg2d = iTexOverlay = iTexBot = iTexFog = 0;
+              for (TInt i = 0; i < KMaxTex; ++i)
+                  {
+                  iTex[i].iName = 0;                         // GL names died with the context
+                  if (!aKeepTextures)
+                      {
+                      User::Free(iTex[i].iPx);
+                      iTex[i].iPx = NULL;
+                      }
+                  }
+              iOk = EFalse;
+              }
+
+          void CRe4Gl::Recover()
+              {
+              Re4Log("gles: context lost, rebuilding");
+              Teardown(ETrue);
+              TRAPD(err, InitEgl(*iWin); InitGl());
+              if (err != KErrNone)
+                  {
+                  Re4Log("gles: rebuild failed %d, rendering stops", err);
+                  return;
+                  }
+              for (TInt i = 0; i < KMaxTex; ++i)
+                  {
+                  if (iTex[i].iPx)
+                      {
+                      CreateGlTex(i);
+                      }
+                  }
+              iOk = ETrue;
+              }
+
+          // ------------------------------------------------------------------ textures
+          void CRe4Gl::CreateGlTex(TInt aId)
+              {
+              TTex& t = iTex[aId];
+              GLuint n = 0;
+              glGenTextures(1, &n);
+              glBindTexture(GL_TEXTURE_2D, n);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+              const TBool pot = !(t.iW & (t.iW - 1)) && !(t.iH & (t.iH - 1));     // REPEAT needs power-of-two in ES 2
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, (pot && t.iWrapS) ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, (pot && t.iWrapT) ? GL_REPEAT : GL_CLAMP_TO_EDGE);
+              glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t.iW, t.iH, 0, GL_RGBA, GL_UNSIGNED_BYTE, t.iPx);
+              t.iName = n;
+              }
+
+          void CRe4Gl::FreeTex(TInt aId)
+              {
+              TTex& t = iTex[aId];
+              if (t.iName)
+                  {
+                  GLuint n = t.iName;
+                  glDeleteTextures(1, &n);
+                  t.iName = 0;
+                  }
+              User::Free(t.iPx);
+              t.iPx = NULL;
+              }
+
+          void CRe4Gl::PumpTextures()
+              {
+              ShimGlTexEv ev;
+              while (shim_gl_next_tex(&ev))
+                  {
+                  if (ev.id <= 0 || ev.id >= KMaxTex)
+                      {
+                      User::Free(ev.px);
+                      continue;
+                      }
+                  FreeTex(ev.id);
+                  if (ev.kind == 1 && ev.px)
+                      {
+                      TTex& t = iTex[ev.id];
+                      t.iPx = ev.px;                         // the pixels are ours now (shared heap)
+                      t.iW = ev.w;
+                      t.iH = ev.h;
+                      t.iWrapS = ev.wrap_s;
+                      t.iWrapT = ev.wrap_t;
+                      SwapRB(t.iPx, ev.w * ev.h);
+                      CreateGlTex(ev.id);
+                      }
+                  }
+              }
+
+          void CRe4Gl::UploadScreens()
+              {
+              for (TInt i = 0; i < 2; ++i)
+                  {
+                  host_lock();
+                  Mem::Copy(iBuf, i == 0 ? shim_top : shim_bot, 256 * 192 * 4);
+                  host_unlock();
+                  SwapRB(iBuf, 256 * 192);
+                  glBindTexture(GL_TEXTURE_2D, i == 0 ? iTexOverlay : iTexBot);
+                  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 192, GL_RGBA, GL_UNSIGNED_BYTE, iBuf);
+                  }
+              }
+
+          // ------------------------------------------------------------------ drawing
+          void CRe4Gl::DrawGeo(const ShimGlGeo& aG)
+              {
+              glUseProgram(iProgGeo);
+              glEnable(GL_DEPTH_TEST);
+              glDepthFunc(GL_LESS);
+              glDepthMask(GL_TRUE);
+              glDisable(GL_BLEND);
+              glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+              const char* base = (const char*)aG.v;
+              glEnableVertexAttribArray(0);
+              glEnableVertexAttribArray(1);
+              glEnableVertexAttribArray(2);
+              glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(ShimGlVert), base);
+              glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(ShimGlVert), base + 16);
+              glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(ShimGlVert), base + 24);
+
+              glActiveTexture(GL_TEXTURE1);
+              glBindTexture(GL_TEXTURE_2D, iTexFog);
+              if (aG.fog_on && aG.seq != iLastFogSeq)
+                  {
+                  glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 1, GL_LUMINANCE, GL_UNSIGNED_BYTE, aG.fog_lut);
+                  iLastFogSeq = aG.seq;
+                  }
+              glActiveTexture(GL_TEXTURE0);
+              glUniform1i(iGeoU[0], 0);
+              glUniform1i(iGeoU[1], 1);
+              glUniform4f(iGeoU[2], aG.fog_col[0] / 31.0f, aG.fog_col[1] / 31.0f, aG.fog_col[2] / 31.0f, 1.0f);
+
+              TUint curFlags = 0xFFFFFFFFu;
+              TInt curTex = -1;
+              for (TInt i = 0; i < aG.nb; ++i)
+                  {
+                  const ShimGlBatch& b = aG.b[i];
+                  if (b.flags != curFlags)
+                      {
+                      curFlags = b.flags;
+                      const TBool trans = (b.flags & SHIM_GLB_TRANS) != 0;
+                      if (trans) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+                      glDepthMask((b.flags & SHIM_GLB_DEPTHW) ? GL_TRUE : GL_FALSE);
+                      glDepthFunc((b.flags & SHIM_GLB_DEQ) ? GL_LEQUAL : GL_LESS);
+                      glUniform1f(iGeoU[4], (b.flags & SHIM_GLB_FOG) ? 1.0f : 0.0f);
+                      glUniform1f(iGeoU[5], trans ? 0.004f : 0.5f);
+                      }
+                  if (b.tex != curTex)
+                      {
+                      curTex = b.tex;
+                      if (b.tex > 0 && b.tex < KMaxTex && iTex[b.tex].iName)
+                          {
+                          glBindTexture(GL_TEXTURE_2D, iTex[b.tex].iName);
+                          glUniform1f(iGeoU[3], 1.0f);
+                          }
+                      else
+                          {
+                          glUniform1f(iGeoU[3], 0.0f);
+                          }
+                      }
+                  glDrawArrays(GL_TRIANGLES, b.first, b.count);
+                  }
+              glDepthMask(GL_TRUE);
+              glDisable(GL_DEPTH_TEST);
+              glDisable(GL_BLEND);
+              }
+
+          void CRe4Gl::DrawTexQuad(TUint aTex, TBool aBlend)
+              {
+              glUseProgram(iProg2d);
+              glDisable(GL_DEPTH_TEST);
+              if (aBlend)
+                  {
+                  glEnable(GL_BLEND);
+                  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                  }
+              else
+                  {
+                  glDisable(GL_BLEND);
+                  }
+              glActiveTexture(GL_TEXTURE0);
+              glBindTexture(GL_TEXTURE_2D, aTex);
+              glUniform1i(iFlatU[0], 0);
+              glUniform1f(iFlatU[2], 1.0f);
+              glEnableVertexAttribArray(0);
+              glEnableVertexAttribArray(1);
+              glDisableVertexAttribArray(2);
+              glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, KQuadPos);
+              glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, KQuadUv);
+              glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+              glDisable(GL_BLEND);
+              }
+
+          void CRe4Gl::DrawSolid(TInt aLevel)
+              {
+              if (!aLevel)
+                  {
+                  return;
+                  }
+              const TBool white = aLevel > 0;
+              const GLfloat a = (white ? aLevel : -aLevel) / 16.0f;
+              glUseProgram(iProg2d);
+              glDisable(GL_DEPTH_TEST);
+              glEnable(GL_BLEND);
+              glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+              glUniform1f(iFlatU[2], 0.0f);
+              glUniform4f(iFlatU[1], white ? 1.0f : 0.0f, white ? 1.0f : 0.0f, white ? 1.0f : 0.0f, a);
+              glEnableVertexAttribArray(0);
+              glEnableVertexAttribArray(1);
+              glDisableVertexAttribArray(2);
+              glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, KQuadPos);
+              glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, KQuadUv);
+              glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+              glDisable(GL_BLEND);
+              }
+
+          void CRe4Gl::Render()
+              {
+              if (!iOk)
+                  {
+                  return;
+                  }
+              PumpTextures();
+              const ShimGlGeo* g = shim_gl_acquire();
+              ShimGlParams p;
+              shim_gl_get_params(&p);
+              UploadScreens();
+
+              const TInt sw = iW / 2, sh = iH;
+              const TInt mainX = p.swap ? sw : 0, subX = p.swap ? 0 : sw;
+
+              glDisable(GL_SCISSOR_TEST);
+              glViewport(0, 0, iW, iH);
+              glDepthMask(GL_TRUE);
+              glClearColor(0.f, 0.f, 0.f, 1.f);
+              glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+              glEnable(GL_SCISSOR_TEST);
+
+              // main screen: 3D, fade of the 3D layer, sprites, screen fade
+              glViewport(mainX, 0, sw, sh);
+              glScissor(mainX, 0, sw, sh);
+              if (g)
+                  {
+                  glClearColor(g->clr[0] / 31.0f, g->clr[1] / 31.0f, g->clr[2] / 31.0f, 1.0f);
+                  glClearDepthf(g->clr_depth / 32767.0f);
+                  glDepthMask(GL_TRUE);
+                  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                  DrawGeo(*g);
+                  }
+              if (p.dim3d > 0)
+                  {
+                  DrawSolid(-p.dim3d);
+                  }
+              DrawTexQuad(iTexOverlay, ETrue);
+              DrawSolid(p.bright_main);
+
+              // sub screen
+              glViewport(subX, 0, sw, sh);
+              glScissor(subX, 0, sw, sh);
+              DrawTexQuad(iTexBot, EFalse);
+              DrawSolid(p.bright_sub);
+
+              if (!eglSwapBuffers((EGLDisplay)iDisplay, (EGLSurface)iSurface))
+                  {
+                  EGLint err = eglGetError();
+                  Re4Log("gles: eglSwapBuffers failed %x", (unsigned)err);
+                  if (err == EGL_CONTEXT_LOST)
+                      {
+                      Recover();
+                      }
+                  }
+              }
+
           RE4_EOF
           mkdir -p symbian/app/src
           cat > symbian/app/src/re4ds_host.cpp <<'RE4_EOF'
@@ -966,9 +1664,25 @@ jobs:
 
           extern "C" {
 
-          void* host_alloc(size_t aSize) { return User::Alloc((TInt)aSize); }
+          void* host_alloc(size_t aSize)
+              {
+              void* p = User::Alloc((TInt)aSize);
+              if (!p || aSize >= 262144)
+                  {
+                  Re4Log("alloc %d KB -> %s", (TInt)(aSize / 1024), p ? "ok" : "FAILED");
+                  }
+              return p;
+              }
           void host_free(void* aPtr) { User::Free(aPtr); }
-          void* host_realloc(void* aPtr, size_t aSize) { return User::ReAlloc(aPtr, (TInt)aSize); }
+          void* host_realloc(void* aPtr, size_t aSize)
+              {
+              void* p = User::ReAlloc(aPtr, (TInt)aSize);
+              if (!p)
+                  {
+                  Re4Log("realloc %d KB FAILED", (TInt)(aSize / 1024));
+                  }
+              return p;
+              }
 
           unsigned host_ticks_ms(void)
               {
@@ -989,7 +1703,16 @@ jobs:
           // Own file-server session per call, so it works from any thread and before the game thread exists.
           void host_log(const char* aMsg)
               {
-              TPtrC8 m((const TUint8*)aMsg);
+              static TUint32 start = 0;
+              TUint32 now = host_ticks_ms();
+              if (!start)
+                  {
+                  start = now;
+                  }
+              TUint32 up = now - start;
+              char stamped[280];
+              snprintf(stamped, sizeof(stamped), "[%u.%03u] %s", (unsigned)(up / 1000), (unsigned)(up % 1000), aMsg);
+              TPtrC8 m((const TUint8*)stamped);
               RDebug::RawPrint(m);
               RFs fs;
               if (fs.Connect() != KErrNone)
@@ -1088,15 +1811,30 @@ jobs:
                   {
                   err = gFile[h].Open(gFs, name, EFileRead | EFileShareAny);
                   }
-              if (err != KErrNone) return -1;
+              if (err != KErrNone)
+                  {
+                  Re4Log("fopen failed %d: %s", err, aPath);
+                  return -1;
+                  }
               gUsed[h] = ETrue;
+              Re4Log("open %s", aPath);
               return h;
               }
 
           int host_fread(int aH, void* aBuf, int aN)
               {
               TPtr8 d((TUint8*)aBuf, 0, aN);
-              if (gFile[aH].Read(d, aN) != KErrNone) return -1;
+              TUint32 t0 = host_ticks_ms();
+              TInt rerr = gFile[aH].Read(d, aN);
+              if (aN >= 1048576)
+                  {
+                  Re4Log("read %d KB in %u ms (err %d)", aN / 1024, (unsigned)(host_ticks_ms() - t0), rerr);
+                  }
+              if (rerr != KErrNone)
+                  {
+                  Re4Log("read failed %d (%d bytes)", rerr, aN);
+                  return -1;
+                  }
               return d.Length();
               }
 
@@ -1189,6 +1927,9 @@ jobs:
                   return KErrNoMemory;
                   }
               Re4Log("game thread: started");
+              Re4Log("addr re4_main=%08x swiWaitForVBlank=%08x Re4GameThread=%08x",
+                     (unsigned)reinterpret_cast<TUint32>(&re4_main), (unsigned)reinterpret_cast<TUint32>(&swiWaitForVBlank),
+                     (unsigned)reinterpret_cast<TUint32>(&Re4GameThread));
               if (gFs.Connect() == KErrNone)
                   {
                   PickRoot();
@@ -1197,8 +1938,7 @@ jobs:
                   r8.Copy(gRoot);
                   r8.ZeroTerminate();
                   Re4Log("game thread: data root %s", (const char*)r8.Ptr());
-                  shim_frameskip_enable = 1;      // behind the 60 Hz schedule: drop the 3D pass of some frames
-              shim_load_databins();
+                  shim_load_databins();
                   Re4Log("game thread: calling re4_main");
                   re4_main();
                   Re4Log("game thread: re4_main returned");
@@ -1210,6 +1950,164 @@ jobs:
                   }
               delete cleanup;
               return 0;
+              }
+          RE4_EOF
+          mkdir -p symbian/app/src
+          cat > symbian/app/src/re4ds_watch.cpp <<'RE4_EOF'
+          // Independent watchdog thread: wakes once a second (higher priority than the UI and the game),
+          // writes a status line and, when the game thread or the UI thread stops making progress, dumps
+          // the shim's call trace and samples the stuck thread's program counter. Because it is its own
+          // thread it still reports when the UI is frozen too.
+          #include <e32base.h>
+          #include <e32std.h>
+          #include <hal.h>
+          #include "re4ds.h"
+
+          static volatile TBool gStop;
+          static TThreadId gUiId;
+          static TThreadId gGameId;
+          static RThread gWatch;
+          static TBool gWatchStarted;
+
+          static void LogContext(const char* aWho, TThreadId aId)
+              {
+              RThread t;
+              TInt err = t.Open(aId);
+              if (err != KErrNone)
+                  {
+                  Re4Log("  %s: cannot open thread (%d)", aWho, err);
+                  return;
+                  }
+              for (TInt i = 0; i < 3; ++i)
+                  {
+                  TUint32 regs[48];
+                  Mem::FillZ(regs, sizeof(regs));
+                  TPtr8 d((TUint8*)regs, 0, sizeof(regs));
+                  t.Suspend();
+                  err = t.Context(d);
+                  t.Resume();
+                  Re4Log("  %s ctx%d err=%d pc=%08x lr=%08x sp=%08x", aWho, i, err, (unsigned)regs[15],
+                         (unsigned)regs[14], (unsigned)regs[13]);
+                  User::After(30000);
+                  }
+              t.Close();
+              }
+
+          static void LogTrace()
+              {
+              char buf[900];
+              TInt n = shim_trace_dump(buf, sizeof(buf));
+              Re4Log("  last API calls of the game (oldest first):");
+              for (TInt off = 0; off < n; off += 170)
+                  {
+                  char part[176];
+                  TInt len = n - off < 170 ? n - off : 170;
+                  Mem::Copy(part, buf + off, len);
+                  part[len] = 0;
+                  Re4Log("    %s", part);
+                  }
+              }
+
+          static TInt Re4WatchThread(TAny*)
+              {
+              CTrapCleanup* cleanup = CTrapCleanup::New();
+              TUint lastFrame = shim_frame_no;
+              TUint lastUi = shim_ui_ticks;
+              TInt frameStall = 0, uiStall = 0;
+              TBool deathLogged = EFalse;
+              Re4Log("watchdog: running (1 line per second: frames/ui ticks gained, free RAM, game heap)");
+              while (!gStop)
+                  {
+                  User::After(1000000);
+                  if (gStop)
+                      {
+                      break;
+                      }
+                  TUint f = shim_frame_no;
+                  TUint u = shim_ui_ticks;
+                  TInt ramFree = 0;
+                  HAL::Get(HALData::EMemoryRAMFree, ramFree);
+                  TInt heap = 0, stack = 0;
+                  RThread g;
+                  TBool haveGame = g.Open(gGameId) == KErrNone;
+                  if (haveGame)
+                      {
+                      g.GetRamSizes(heap, stack);
+                      }
+                  char tail[120];
+                  shim_trace_tail(tail, sizeof(tail), 5);
+                  Re4Log("wd: frame +%u ui +%u | free RAM %d KB | game heap %d KB | in '%s' | %s", f - lastFrame,
+                         u - lastUi, ramFree / 1024, heap / 1024, shim_where ? shim_where : "?", tail);
+
+                  if (haveGame && !deathLogged && g.ExitType() != EExitPending)
+                      {
+                      deathLogged = ETrue;
+                      TExitCategoryName cat = g.ExitCategory();
+                      TBuf8<KMaxExitCategoryName> cat8;
+                      cat8.Copy(cat);
+                      cat8.ZeroTerminate();
+                      Re4Log("GAME THREAD DIED: type=%d reason=%d category=%s", (TInt)g.ExitType(), g.ExitReason(),
+                             (const char*)cat8.Ptr());
+                      LogTrace();
+                      }
+                  if (haveGame)
+                      {
+                      g.Close();
+                      }
+
+                  frameStall = (f == lastFrame && !shim_pause && !deathLogged) ? frameStall + 1 : 0;
+                  uiStall = (u == lastUi) ? uiStall + 1 : 0;
+                  lastFrame = f;
+                  lastUi = u;
+
+                  if (uiStall == 3 || (uiStall > 3 && uiStall % 10 == 0))
+                      {
+                      Re4Log("UI THREAD FROZEN for %d s (the window does not run its timer)", uiStall);
+                      LogContext("UI", gUiId);
+                      LogTrace();
+                      }
+                  if (frameStall == 3 || (frameStall > 3 && frameStall % 10 == 0))
+                      {
+                      Re4Log("GAME STALLED for %d s: no new frame, stuck in '%s'", frameStall, shim_where ? shim_where : "?");
+                      LogContext("GAME", gGameId);
+                      LogTrace();
+                      }
+                  }
+              delete cleanup;
+              return 0;
+              }
+
+          void Re4StartWatchdog(TThreadId aUi, TThreadId aGame)
+              {
+              gUiId = aUi;
+              gGameId = aGame;
+              gStop = EFalse;
+              TInt err = gWatch.Create(_L("re4ds_wd"), Re4WatchThread, 0x8000, 0x10000, 0x100000, NULL, EOwnerProcess);
+              Re4Log("watchdog thread create %d", err);
+              if (err == KErrNone)
+                  {
+                  gWatch.SetPriority(EPriorityMore);
+                  gWatch.Resume();
+                  gWatchStarted = ETrue;
+                  }
+              }
+
+          void Re4StopWatchdog()
+              {
+              gStop = ETrue;
+              if (gWatchStarted)
+                  {
+                  for (TInt i = 0; i < 150 && gWatch.ExitType() == EExitPending; ++i)
+                      {
+                      User::After(10000);
+                      }
+                  if (gWatch.ExitType() == EExitPending)
+                      {
+                      gWatch.Kill(0);
+                      }
+                  gWatch.Close();
+                  gWatchStarted = EFalse;
+                  }
               }
           RE4_EOF
           mkdir -p symbian/group
@@ -1240,11 +2138,11 @@ jobs:
           SOURCE          re4ds_container.cpp
           SOURCE          re4ds_audio.cpp
           SOURCE          re4ds_host.cpp
+          SOURCE          re4ds_watch.cpp
 
           SOURCEPATH      ../shim
           SOURCE          dsshim.c
           SOURCE          gx.c
-          SOURCE          glesr.c
           SOURCE          rt.c
 
           SOURCEPATH      ../gen
@@ -1273,8 +2171,7 @@ jobs:
 
           LIBRARY         euser.lib apparc.lib cone.lib eikcore.lib avkon.lib eikcoctl.lib
           LIBRARY         fbscli.lib bitgdi.lib gdi.lib ws32.lib efsrv.lib
-          LIBRARY         mediaclientaudiostream.lib bafl.lib
-          LIBRARY         libEGL.lib libGLESv2.lib
+          LIBRARY         mediaclientaudiostream.lib bafl.lib hal.lib
 
           OPTION          GCCE -O2 -fno-strict-aliasing
           RE4_EOF
@@ -1283,11 +2180,58 @@ jobs:
           // dsshim.c - everything of libnds except the geometry engine (gx.c): maths, input, timing,
           // sprites, sub-screen bitmap, console, sound mixing.
           #include "nds.h"
+          #include "gl_iface.h"
           #include <stdarg.h>
 
           void host_exit_thread(void);
           void shim_dma_run(void);
-          extern u32 shim_fb3d[256 * 192];
+
+          /* ------------------------------------------------------------------ trace ring */
+          typedef struct { const char *n; u32 f; } Trace;
+          static Trace trace_ring[64];
+          static volatile u32 trace_idx;
+          volatile u32 shim_ui_ticks;
+
+          void shim_trace(const char *n)
+          {
+              u32 i = trace_idx++;
+              trace_ring[i & 63].n = n;
+              trace_ring[i & 63].f = shim_frame_no;
+          }
+
+          /* "f12:glFlush f12:vblank x3 ..." oldest first, repeats collapsed */
+          int shim_trace_dump(char *buf, int cap)
+          {
+              int len = 0;
+              u32 end = trace_idx, start = end > 64 ? end - 64 : 0;
+              for (u32 i = start; i < end && len < cap - 40;)
+              {
+                  const Trace *t = &trace_ring[i & 63];
+                  u32 j = i + 1;
+                  while (j < end && trace_ring[j & 63].n == t->n && trace_ring[j & 63].f == t->f) j++;
+                  if (!t->n) { i = j; continue; }
+                  len += snprintf(buf + len, cap - len, "f%u:%s", (unsigned)t->f, t->n);
+                  if (j - i > 1) len += snprintf(buf + len, cap - len, "x%u", (unsigned)(j - i));
+                  buf[len++] = ' ';
+                  buf[len] = 0;
+                  i = j;
+              }
+              return len;
+          }
+
+          /* last n calls, newest last: "glFlush vblank scanKeys" */
+          int shim_trace_tail(char *buf, int cap, int n)
+          {
+              int len = 0;
+              u32 end = trace_idx, start = end > (u32)n ? end - n : 0;
+              buf[0] = 0;
+              for (u32 i = start; i < end && len < cap - 24; i++)
+              {
+                  const char *nm = trace_ring[i & 63].n;
+                  if (nm) len += snprintf(buf + len, cap - len, "%s ", nm);
+              }
+              return len;
+          }
 
           /* ------------------------------------------------------------------ maths */
           static double my_sin(double x)
@@ -1362,6 +2306,7 @@ jobs:
 
           void scanKeys(void)
           {
+              shim_trace("scanKeys");
               u32 now = in_keys & 0xFFF;
               if (in_touch) now |= KEY_TOUCH;
               k_down = now & ~k_held;
@@ -1373,6 +2318,7 @@ jobs:
           u32 keysUp(void) { return k_up; }
           void touchRead(touchPosition *t)
           {
+              shim_trace("touchRead");
               int x = in_tx, y = in_ty;
               if (x < 0) x = 0; if (x > 255) x = 255;
               if (y < 0) y = 0; if (y > 191) y = 191;
@@ -1400,24 +2346,30 @@ jobs:
 
           static u32 vb_next3;         /* next vblank time, in 1/3 ms */
           volatile u32 shim_frame_no;
-          volatile u32 shim_present_count;     /* bumped by every shim_present: the front end redraws only on a change */
-          volatile int shim_skip_render;       /* 1: the next 3D pass (glFlush) is skipped, the last picture stays */
-          volatile int shim_frameskip_enable;  /* set by the Symbian front end only (the host test keeps every frame) */
-          volatile u32 shim_last_render;       /* host_ticks_ms() when the last 3D pass finished */
-          static int skip_run, skip_present;
-          #define SHIM_MAX_SKIP 30
-          #define SHIM_MAX_STALE_MS 90        /* the picture is never older than this (about 11 fps on screen at worst) */
+          const char *volatile shim_where = "start";
+          volatile u32 shim_ms_flush, shim_ms_present, shim_polys_last;
+          static u32 acc_flush, acc_present, acc_frames, last_log_ms, last_ui, last_frame_ms;
           void shim_present(void);
 
           void swiWaitForVBlank(void)
           {
-              shim_dma_run();
-              /* a frame whose 3D pass was skipped shows nothing new: only now and then update sprites / sub screen */
-              if (!shim_skip_render || ++skip_present >= 4)
+              shim_trace("vblank");
               {
-                  skip_present = 0;
-                  shim_present();
+                  u32 t0 = host_ticks_ms();
+                  if (last_frame_ms && t0 - last_frame_ms > 250)
+                  {
+                      char m[128];
+                      snprintf(m, sizeof m, "SLOW FRAME %u: %u ms since the last vblank (render %u ms)", (unsigned)shim_frame_no,
+                               (unsigned)(t0 - last_frame_ms), (unsigned)shim_ms_flush);
+                      host_log(m);
+                  }
               }
+              shim_where = "present";
+              shim_dma_run();
+              u32 tp = host_ticks_ms();
+              shim_present();
+              acc_present += host_ticks_ms() - tp;
+              shim_where = "vblank-wait";
               if (shim_pause)
               {
                   while (shim_pause && !shim_quit) host_sleep_ms(40);
@@ -1426,30 +2378,33 @@ jobs:
               u32 now = host_ticks_ms();
               if (!vb_next3) vb_next3 = now * 3;
               vb_next3 += 50;                         /* 16.67 ms */
-              int late = (int)(now - vb_next3 / 3);   /* ms behind the 60 Hz schedule */
-              if (late < 0)
-              {
-                  host_sleep_ms((unsigned)-late);
-                  shim_skip_render = 0; skip_run = 0;
-              }
-              else if (shim_frameskip_enable && late > 4 && skip_run < SHIM_MAX_SKIP && (now - shim_last_render) < SHIM_MAX_STALE_MS)
-              {
-                  /* behind: drop the next frame's rasterising (the costly part), keep the game logic on time */
-                  shim_skip_render = 1; skip_run++;
-              }
+              u32 target = vb_next3 / 3;
+              if (target > now) host_sleep_ms(target - now);
               else
               {
-                  shim_skip_render = 0; skip_run = 0;
+                  host_sleep_ms(1);                 /* always yield: the UI thread must get CPU time */
+                  if (now - target > 100) vb_next3 = now * 3;
               }
-              if (late > (shim_frameskip_enable ? 1500 : 100)) vb_next3 = now * 3;   /* a long stall: do not chase it */
               IntFn f = irq_fn[0];
               if (f) f();
               shim_frame_no++;
-              if (shim_frame_no == 1 || shim_frame_no == 2 || shim_frame_no == 60 || shim_frame_no == 600)
+              last_frame_ms = host_ticks_ms();
+              acc_frames++;
+              acc_flush += shim_ms_flush;
+              if (shim_frame_no == 1 || (shim_frame_no % 120) == 0)
               {
-                  char m[64];
-                  snprintf(m, sizeof m, "vblank frame %u", (unsigned)shim_frame_no);
+                  char m[160];
+                  u32 t = host_ticks_ms();
+                  u32 span = last_log_ms ? t - last_log_ms : 0;
+                  snprintf(m, sizeof m, "frame %u: %u ms/%u fr, render %u ms, present %u ms, %u polys, ui+%u",
+                           (unsigned)shim_frame_no, (unsigned)span, (unsigned)acc_frames,
+                           (unsigned)(acc_frames ? acc_flush / acc_frames : 0),
+                           (unsigned)(acc_frames ? acc_present / acc_frames : 0), (unsigned)shim_polys_last,
+                           (unsigned)(shim_ui_ticks - last_ui));
+                  last_ui = shim_ui_ticks;
                   host_log(m);
+                  last_log_ms = t;
+                  acc_flush = acc_present = acc_frames = 0;
               }
               if (shim_quit) host_exit_thread();
           }
@@ -1461,6 +2416,7 @@ jobs:
 
           void consoleDemoInit(void)
           {
+              shim_trace("consoleDemoInit");
               con_len = 0;
               shim_console[0] = 0;
               shim_console_on = 1;
@@ -1484,6 +2440,7 @@ jobs:
           int bgInitSub(int layer, BgType t, BgSize s, int mb, int tb)
           {
               (void)layer; (void)t; (void)s; (void)mb; (void)tb;
+              shim_trace("bgInitSub");
               shim_console_on = 0;
               return 3;
           }
@@ -1517,7 +2474,7 @@ jobs:
               (void)o; (void)id; (void)angle;
               aff_pa = sx; aff_pd = sy;       /* (the game only scales) */
           }
-          void oamUpdate(OamState *o) { (void)o; }
+          void oamUpdate(OamState *o) { (void)o; shim_trace("oamUpdate"); }
 
           static u32 rgb555(u16 c)
           {
@@ -1559,7 +2516,7 @@ jobs:
                               if (sx < 0 || sx >= 32 || sy < 0 || sy >= 16) continue;
                           }
                           int c = spr_pixel(s, sx, sy);
-                          if (c) dst[y * 256 + x] = rgb555(shim_spr_pal[s->pal * 16 + c]);
+                          if (c) dst[y * 256 + x] = 0xFF000000u | rgb555(shim_spr_pal[s->pal * 16 + c]);
                       }
                   }
               }
@@ -1569,6 +2526,13 @@ jobs:
           u32 shim_bot[256 * 192];
 
           static int bright[2], lcd_swap;
+          static ShimGlParams gl_params;
+          void shim_gl_get_params(ShimGlParams *p)
+          {
+              host_lock();
+              *p = gl_params;
+              host_unlock();
+          }
           void setBrightness(int screen, int level)
           {
               if (level > 16) level = 16;
@@ -1579,14 +2543,6 @@ jobs:
           void lcdMainOnTop(void) { lcd_swap = 0; }
           void lcdMainOnBottom(void) { lcd_swap = 1; }
 
-          static u32 shade(u32 c, int lvl)
-          {
-              u32 r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
-              if (lvl < 0) { r = r * (16 + lvl) >> 4; g = g * (16 + lvl) >> 4; b = b * (16 + lvl) >> 4; }
-              else { r += (255 - r) * lvl >> 4; g += (255 - g) * lvl >> 4; b += (255 - b) * lvl >> 4; }
-              return r << 16 | g << 8 | b;
-          }
-
           void shim_present(void)
           {
               int lvl = 0;
@@ -1594,31 +2550,20 @@ jobs:
                   lvl = shim_bldy & 31;
               if (lvl > 16) lvl = 16;
               static u32 top[256 * 192], bot[256 * 192];
-              if (lvl)
-                  for (int i = 0; i < 256 * 192; i++)
-                  {
-                      u32 c = shim_fb3d[i];
-                      u32 r = ((c >> 16) & 255) * (16 - lvl) >> 4, g = ((c >> 8) & 255) * (16 - lvl) >> 4, b = (c & 255) * (16 - lvl) >> 4;
-                      top[i] = r << 16 | g << 8 | b;
-                  }
-              else
-                  memcpy(top, shim_fb3d, sizeof top);
+              /* the GLES renderer gets the sprite layer (with alpha) and the sub screen, and does the rest */
+              memset(top, 0, sizeof top);
               draw_sprites(top);
-              if (bright[0]) for (int i = 0; i < 256 * 192; i++) top[i] = shade(top[i], bright[0]);
-              if (shim_console_on)
-                  memset(bot, 0, sizeof bot);
-              else
-                  for (int i = 0; i < 256 * 192; i++)
-                  {
-                      u16 c = sub_vram[i];
-                      bot[i] = (c & 0x8000) ? rgb555(c) : 0;
-                  }
-              if (bright[1]) for (int i = 0; i < 256 * 192; i++) bot[i] = shade(bot[i], bright[1]);
+              for (int i = 0; i < 256 * 192; i++)
+              {
+                  u16 c = sub_vram[i];
+                  bot[i] = 0xFF000000u | ((!shim_console_on && (c & 0x8000)) ? rgb555(c) : 0);
+              }
               host_lock();
-              memcpy(shim_top, lcd_swap ? bot : top, sizeof top);
-              memcpy(shim_bot, lcd_swap ? top : bot, sizeof bot);
+              memcpy(shim_top, top, sizeof top);
+              memcpy(shim_bot, bot, sizeof bot);
+              gl_params.dim3d = lvl; gl_params.bright_main = bright[0]; gl_params.bright_sub = bright[1];
+              gl_params.swap = lcd_swap; gl_params.console = shim_console_on; gl_params.seq++;
               host_unlock();
-              shim_present_count++;
           }
 
           /* ------------------------------------------------------------------ sound */
@@ -1679,6 +2624,7 @@ jobs:
 
           int soundPlaySample(const void *data, SoundFormat fmt, u32 size, u16 freq, u8 vol, u8 pan, bool loop, u16 lp)
           {
+              shim_trace("soundPlay");
               host_lock();
               int id = -1;
               for (int i = 0; i < 16; i++)
@@ -1706,7 +2652,7 @@ jobs:
               return id;
           }
           void soundSetVolume(int ch, u8 vol) { if (ch >= 0 && ch < 16) chan[ch].vol = vol; }
-          void soundKill(int ch) { if (ch >= 0 && ch < 16) chan[ch].active = 0; }
+          void soundKill(int ch) { shim_trace("soundKill"); if (ch >= 0 && ch < 16) chan[ch].active = 0; }
 
           int shim_audio_mix(s16 *out, int frames)
           {
@@ -1744,17 +2690,64 @@ jobs:
           #include <nds.h>
           RE4_EOF
           mkdir -p symbian/shim
+          cat > symbian/shim/gl_iface.h <<'RE4_EOF'
+          // gl_iface.h - data handed from the software DS layer (game thread) to the GLES 2.0 renderer
+          // (UI thread). Plain C, shared by gx.c / dsshim.c and the Symbian front end.
+          #ifndef GL_IFACE_H
+          #define GL_IFACE_H
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          /* x,y,z,w,u,v hold IEEE-754 float bit patterns (built with integer maths: no soft-float on the ARM11) */
+          typedef struct { unsigned int x, y, z, w, u, v; unsigned char r, g, b, a; } ShimGlVert;   /* 28 bytes */
+          typedef struct { int first, count, tex; unsigned int flags; } ShimGlBatch;
+          #define SHIM_GLB_TRANS 1
+          #define SHIM_GLB_FOG 2
+          #define SHIM_GLB_DEPTHW 4
+          #define SHIM_GLB_DEQ 8
+
+          typedef struct {
+              ShimGlVert *v; int nv;
+              ShimGlBatch *b; int nb;
+              unsigned char clr[3];          /* clear colour (5 bit) */
+              unsigned char fog_on;
+              unsigned char fog_col[3];      /* 5 bit */
+              unsigned char pad;
+              unsigned short clr_depth;
+              unsigned char fog_lut[512];    /* density 0..254, indexed by depth / 64 */
+              unsigned int seq;
+          } ShimGlGeo;
+
+          typedef struct {
+              int kind;                      /* 1 = upload (px now owned by the receiver), 2 = delete */
+              int id, w, h, wrap_s, wrap_t;
+              unsigned int *px;              /* 0xAARRGGBB */
+          } ShimGlTexEv;
+
+          typedef struct { int dim3d, bright_main, bright_sub, swap, console; unsigned int seq; } ShimGlParams;
+
+          extern volatile int shim_gl_mode;
+          int shim_gl_enable(void);                         /* call before the game thread starts; 1 = ok */
+          const ShimGlGeo *shim_gl_acquire(void);           /* latest 3D frame, valid until the next acquire */
+          int shim_gl_next_tex(ShimGlTexEv *ev);            /* 1 = event returned */
+          void shim_gl_get_params(ShimGlParams *p);
+
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          RE4_EOF
+          mkdir -p symbian/shim
           cat > symbian/shim/gx.c <<'RE4_EOF'
-          // gx.c - emulation of the DS 3D engine: matrix stacks, packed GX commands, clipping and a polygon
-          // buffer (2048 polygons / 6144 vertices like the hardware). The polygons are drawn by OpenGL ES 2.0
-          // (glesr.c); there is no software rasteriser.
+          // gx.c - emulation of the DS 3D engine front end: matrix stacks, packed GX commands, clipping,
+          // culling and a polygon buffer (2048 polygons / 6144 vertices like the hardware). The polygons are
+          // handed to the GLES 2.0 renderer (see the end of this file). Integer only.
           #include "nds.h"
+          #include "gl_iface.h"
 
           IntFn shim_irq_handler(int bit);
-          extern volatile int shim_skip_render;
-          extern volatile u32 shim_last_render;
 
-          u32 shim_fb3d[256 * 192];
 
           /* ----------------------------------------------------------------- state */
           typedef struct { int m[16]; } Mat;            /* row vectors: v' = v * M, f32 entries */
@@ -1777,16 +2770,18 @@ jobs:
               u32 *px;            /* ARGB, a = 0..255 */
               u8 *idx;            /* raw texels until the palette arrives */
               u16 w, h;
-              u8 used, type, has_alpha, wrap_s, wrap_t, color0;
+              u8 used, type, has_alpha, wrap_s, wrap_t, color0, ready, lw, lh;
           } Tex;
           #define MAX_TEX 640
           static Tex tex[MAX_TEX];
           static int bound_tex;
-          static u8 gl_up[MAX_TEX];            /* texture i is uploaded to the GPU */
-          void glesr_tex_free(int id);
+          volatile int shim_gl_mode;
+          static void tex_push(int kind, int id, int w, int h, int ws, int wt, u32 *px);
+          static void tex_ready(int id);
 
           void glGenTextures(int n, int *names)
           {
+              shim_trace("glGenTextures");
               for (int k = 0; k < n; k++)
               {
                   names[k] = 0;
@@ -1796,12 +2791,13 @@ jobs:
           }
           void glDeleteTextures(int n, int *names)
           {
+              shim_trace("glDeleteTextures");
               for (int k = 0; k < n; k++)
               {
                   int i = names[k];
                   if (i <= 0 || i >= MAX_TEX) continue;
+                  if (shim_gl_mode) tex_push(2, i, 0, 0, 0, 0, 0);
                   free(tex[i].px); free(tex[i].idx);
-                  if (gl_up[i]) { glesr_tex_free(i); gl_up[i] = 0; }
                   memset(&tex[i], 0, sizeof(Tex));
                   if (bound_tex == i) bound_tex = 0;
                   names[k] = 0;
@@ -1810,6 +2806,7 @@ jobs:
           int glBindTexture(int target, int name)
           {
               (void)target;
+              shim_trace("glBindTexture");
               bound_tex = (name > 0 && name < MAX_TEX && tex[name].used) ? name : 0;
               return 1;
           }
@@ -1830,6 +2827,7 @@ jobs:
           int glTexImageNtr2D(GL_TEXTURE_TYPE_ENUM type, int w, int h, int param, const void *texels, const void *unused)
           {
               (void)unused;
+              shim_trace("glTexImage");
               Tex *t = &tex[bound_tex];
               if (!bound_tex || w <= 0 || h <= 0 || w > 1024 || h > 1024) return 0;
               u32 n = (u32)w * h, bytes;
@@ -1842,9 +2840,11 @@ jobs:
               default: return 0;
               }
               free(t->px); free(t->idx);
-              t->px = 0; t->idx = 0;
-              if (gl_up[bound_tex]) { glesr_tex_free(bound_tex); gl_up[bound_tex] = 0; }
+              t->px = 0; t->idx = 0; t->ready = 0;
               t->w = (u16)w; t->h = (u16)h; t->type = (u8)type;
+              t->lw = t->lh = 0;
+              while ((1 << t->lw) < w) t->lw++;
+              while ((1 << t->lh) < h) t->lh++;
               t->has_alpha = type == GL_RGB8_A5 || type == GL_RGB32_A3;
               t->wrap_s = (param & GL_TEXTURE_WRAP_S) != 0;
               t->wrap_t = (param & GL_TEXTURE_WRAP_T) != 0;
@@ -1855,6 +2855,7 @@ jobs:
                   t->px = (u32 *)malloc(n * 4);
                   if (!t->px) return 0;
                   for (u32 i = 0; i < n; i++) t->px[i] = argb555(s[i], (s[i] & 0x8000) ? 255 : 0);
+                  tex_ready(bound_tex);
                   return 1;
               }
               t->idx = (u8 *)malloc(n);
@@ -1869,13 +2870,13 @@ jobs:
 
           int glColorTableNtr(int count, const u16 *pal)
           {
+              shim_trace("glColorTable");
               Tex *t = &tex[bound_tex];
               if (!bound_tex || !t->idx) return 0;
               u32 n = (u32)t->w * t->h;
               u32 lut[256];
-              for (int i = 0; i < 256; i++) lut[i] = i < count ? argb555(pal[i], 255) : (count > 0 ? argb555(pal[count - 1], 255) : 0);
-              if (t->color0 && count > 0 && !t->has_alpha) lut[0] &= 0x00FFFFFF;
-              if (gl_up[bound_tex]) { glesr_tex_free(bound_tex); gl_up[bound_tex] = 0; }
+              for (int i = 0; i < 256; i++) lut[i] = i < count ? argb555(pal[i], 255) : 0;
+              if (t->color0 && count > 0) lut[0] &= 0x00FFFFFF;
               t->px = (u32 *)malloc(n * 4);
               if (!t->px) return 0;
               for (u32 i = 0; i < n; i++)
@@ -1885,6 +2886,7 @@ jobs:
                   {
                       u32 a = b >> 3;
                       t->px[i] = (lut[b & 7] & 0x00FFFFFF) | ((a << 3 | a >> 2) << 24);
+                      if (t->color0 && (b & 7) == 0) t->px[i] &= 0x00FFFFFF;
                   }
                   else if (t->type == GL_RGB32_A3)
                   {
@@ -1895,6 +2897,7 @@ jobs:
               }
               free(t->idx);
               t->idx = 0;
+              tex_ready(bound_tex);
               return 1;
           }
 
@@ -1992,6 +2995,7 @@ jobs:
 
           void gluPerspectivef32(int fovy, int aspect, int zNear, int zFar)
           {
+              shim_trace("gluPerspective");
               int ymax = mulf32(zNear, tanLerp((s16)(fovy >> 1)));
               int xmax = mulf32(ymax, aspect);
               frustum(-xmax, xmax, -ymax, ymax, zNear, zFar);
@@ -2028,13 +3032,15 @@ jobs:
 
           /* ------------------------------------------------------ polygon buffer */
           typedef struct { int sx, sy, z, iw, u, v; u8 r, g, b, pad; } SV;
-          typedef struct { u32 attr; int tex; u8 n, trans, line, pad; SV v[10]; } Poly;
+          typedef struct { u32 attr; int tex; u8 n, trans, line, pad; SV v[6]; } Poly;
           #define MAX_POLY 2048
           #define MAX_VERT 6144
           static Poly polys[MAX_POLY];
           static int npoly, nvert;
 
           typedef struct { int x, y, z, w, u, v; u8 r, g, b; } CV;
+          static void gl_store(int idx, const CV *a, int m, const Poly *p);
+          static void gl_snapshot(void);
 
           static u32 poly_attr = 0x1F0000 | POLY_CULL_NONE, cur_attr;
           static u8 cr = 31, cg = 31, cb = 31;
@@ -2063,29 +3069,14 @@ jobs:
               s64 d = ((nz + 4096) * 0x7FFF) >> 13;
               if (d < 0) d = 0; if (d > 0x7FFF) d = 0x7FFF;
               o->sx = (int)sx; o->sy = (int)sy; o->z = (int)d;
-              o->iw = (int)(rw >> 10);            /* 2^34 / w, from the reciprocal already made */
+              o->iw = (int)(((s64)1 << 34) / w);
               o->u = c->u; o->v = c->v; o->r = c->r; o->g = c->g; o->b = c->b;
-          }
-
-          static s64 plane_d(const CV *v, int pl)      /* >= 0: inside the left / right / bottom / top side */
-          {
-              switch (pl)
-              {
-              case 0: return (s64)v->x + v->w;
-              case 1: return (s64)v->w - v->x;
-              case 2: return (s64)v->y + v->w;
-              default: return (s64)v->w - v->y;
-              }
           }
 
           static void emit(const CV *in, int n)
           {
-              CV a[12], b[12];
+              CV a[8], b[8];
               int m = 0;
-              for (int i = 0; i < n; i++)
-                  for (int j = i + 1; j < n; j++)
-                      if (in[i].x == in[j].x && in[i].y == in[j].y && in[i].z == in[j].z && in[i].w == in[j].w)
-                          return;   /* (a repeated vertex: the empty triangle joining strip runs, no polygon) */
               for (int i = 0; i < n; i++)
               {
                   const CV *p = &in[i], *q = &in[(i + 1) % n];
@@ -2095,29 +3086,10 @@ jobs:
                       lerp_cv(&a[m++], p, q, (dp << 16) / (dp - dq));
               }
               if (m < 3) return;
-              /* the four sides of the view too, as the hardware does: a big floor / wall polygon would otherwise get
-                 screen coordinates far outside the viewport, be clamped and its texture smear into streaks */
-              for (int pl = 0; pl < 4; pl++)
-              {
-                  int neg = 0;
-                  for (int i = 0; i < m; i++) if (plane_d(&a[i], pl) < 0) neg++;
-                  if (neg == 0) continue;
-                  if (neg == m) return;                      /* wholly outside this side: nothing to draw */
-                  int k = 0;
-                  for (int i = 0; i < m; i++)
-                  {
-                      const CV *p = &a[i], *q = &a[(i + 1) % m];
-                      s64 dp = plane_d(p, pl), dq = plane_d(q, pl);
-                      if (dp >= 0) b[k++] = *p;
-                      if ((dp >= 0) != (dq >= 0)) lerp_cv(&b[k++], p, q, (dp << 16) / (dp - dq));
-                  }
-                  for (int i = 0; i < k; i++) a[i] = b[i];
-                  m = k;
-                  if (m < 3) return;
-              }
               int out_far = 0;
               for (int i = 0; i < m; i++) if (a[i].z > a[i].w) out_far++;
               if (out_far == m) return;
+              (void)b;
               if (npoly >= MAX_POLY || nvert + m > MAX_VERT) { shim_gfx_control |= 1 << 13; return; }
 
               Poly *p = &polys[npoly];
@@ -2138,9 +3110,10 @@ jobs:
                   if (cull == 0 || (cull == 1 && front) || (cull == 2 && !front)) return;
               }
               p->attr = cur_attr;
-              p->tex = tex[bound_tex].used && tex[bound_tex].px ? bound_tex : 0;
+              p->tex = tex[bound_tex].used && tex[bound_tex].ready ? bound_tex : 0;
               int alpha = (cur_attr >> 16) & 31;
               p->trans = (alpha < 31 || (p->tex && tex[p->tex].has_alpha)) ? 1 : 0;
+              if (shim_gl_mode) gl_store(npoly, a, m, p);
               npoly++;
               nvert += m;
           }
@@ -2216,126 +3189,11 @@ jobs:
               fog_dirty = 0;
           }
 
-          /* ------------------------------------------------- OpenGL ES 2.0 back end (glesr.c) */
-          int glesr_init(void);
-          void glesr_tex_upload(int id, int w, int h, const unsigned int *argb, int rep_s, int rep_t);
-          void glesr_fog(const unsigned char *lut, int r, int g, int b);
-          void glesr_begin(int cr, int cg, int cb);
-          void glesr_draw(const float *v, int nv, int tex, int blend, int depthwrite);
-          void glesr_end(unsigned int *out);
-
-          static int gl_state;                  /* 0: not tried, 1: OpenGL ES 2.0 draws the 3D screen, -1: it could not start (no 3D) */
-          static int gl_fog_sent;
-          static float *gl_vb;
-          #define GLV 11
-          #define GL_VB_VERTS 16384
-
-          static void gles_probe(void)
-          {
-              gl_state = glesr_init() ? 1 : -1;
-              host_log(gl_state > 0 ? "renderer: OpenGL ES 2.0" : "renderer: OpenGL ES 2.0 FAILED to start (no 3D picture)");
-          }
-
-          /* One polygon as triangles: clip-space positions rebuilt from the screen coordinates and 1/w, so the
-             GPU interpolates texture, colour and fog perspective-correct, as the software path does. */
-          static int gles_build_poly(const Poly *p, float *o)
-          {
-              const Tex *tx = p->tex ? &tex[p->tex] : 0;
-              const float fu = tx ? 1.0f / (16.0f * tx->w) : 0.0f, fv = tx ? 1.0f / (16.0f * tx->h) : 0.0f;
-              const u32 attr = p->attr;
-              const float alpha = ((attr >> 16) & 31) * (1.0f / 31.0f);
-              const float fogf = (fog_on && (attr & POLY_FOG)) ? 1.0f : 0.0f;
-              const float zoff = (attr & POLY_DEPTHTEST_EQUAL) ? -0.04f : 0.0f;   /* "equal" decals: a little nearer */
-              const float cs = tx ? 1.0f / 32.0f : 1.0f / 31.0f, cb = tx ? 1.0f / 32.0f : 0.0f;
-              int n = 0;
-              for (int k = 1; k + 1 < p->n; k++)
-              {
-                  const SV *vs[3] = { &p->v[0], &p->v[k], &p->v[k + 1] };
-                  for (int j = 0; j < 3; j++)
-                  {
-                      const SV *s = vs[j];
-                      float w = s->iw > 0 ? 4194304.0f / (float)s->iw : 1.0f;   /* 2^34 / iw = w, in 1/4096 units */
-                      float x = s->sx * (1.0f / 2048.0f) - 1.0f;
-                      float y = s->sy * (1.0f / 1536.0f) - 1.0f;                 /* (row 0 = top of the picture) */
-                      float z = s->z * (1.0f / 16383.5f) - 1.0f + zoff;
-                      o[0] = x * w; o[1] = y * w; o[2] = z * w; o[3] = w;
-                      o[4] = s->u * fu; o[5] = s->v * fv;
-                      o[6] = (s->r + cb) * cs; o[7] = (s->g + cb) * cs; o[8] = (s->b + cb) * cs;
-                      o[9] = alpha; o[10] = fogf;
-                      o += GLV;
-                      n++;
-                  }
-              }
-              return n;
-          }
-
-          static void gles_flush(int tex, int blend, int dw, int *nv)
-          {
-              if (*nv)
-                  glesr_draw(gl_vb, *nv, tex, blend, dw);
-              *nv = 0;
-          }
-
-          static int render_gles(void)
-          {
-              static int cnt[MAX_TEX + 2];
-              static u16 order[MAX_POLY];
-              if (!gl_vb)
-              {
-                  gl_vb = (float *)malloc((size_t)GL_VB_VERTS * GLV * sizeof(float));
-                  if (!gl_vb) return 0;
-              }
-              if (fog_dirty) { rebuild_fog(); gl_fog_sent = 0; }
-              glesr_fog(gl_fog_sent ? 0 : fog_lut, fog_r << 3 | fog_r >> 2, fog_g << 3 | fog_g >> 2, fog_b << 3 | fog_b >> 2);
-              gl_fog_sent = 1;
-              for (int i = 0; i < npoly; i++)       /* textures not on the GPU yet */
-              {
-                  int ti = polys[i].tex;
-                  if (ti && !gl_up[ti])
-                  {
-                      const Tex *tx = &tex[ti];
-                      int p2w = !(tx->w & (tx->w - 1)), p2h = !(tx->h & (tx->h - 1));
-                      glesr_tex_upload(ti, tx->w, tx->h, (const unsigned int *)tx->px, tx->wrap_s && p2w, tx->wrap_t && p2h);
-                      gl_up[ti] = 1;
-                  }
-              }
-              glesr_begin(clr_r, clr_g, clr_b);
-
-              /* opaque: by texture (they write depth, so the order does not matter) */
-              memset(cnt, 0, sizeof cnt);
-              for (int i = 0; i < npoly; i++)
-                  if (!polys[i].trans && !polys[i].line) cnt[polys[i].tex + 1]++;
-              for (int t = 0; t < MAX_TEX; t++) cnt[t + 1] += cnt[t];
-              int no = 0;
-              for (int i = 0; i < npoly; i++)
-                  if (!polys[i].trans && !polys[i].line) { order[cnt[polys[i].tex]++] = (u16)i; no++; }
-              int nv = 0, cur = -1;
-              for (int k = 0; k < no; k++)
-              {
-                  const Poly *p = &polys[order[k]];
-                  if (p->tex != cur || nv + 24 > GL_VB_VERTS) { gles_flush(cur, 0, 1, &nv); cur = p->tex; }
-                  nv += gles_build_poly(p, gl_vb + nv * GLV);
-              }
-              gles_flush(cur, 0, 1, &nv);
-
-              /* translucent: in the order sent */
-              int ct = -1, cd = -1;
-              for (int i = 0; i < npoly; i++)
-              {
-                  const Poly *p = &polys[i];
-                  if (!p->trans || p->line) continue;
-                  int dw = (p->attr & POLY_NEW_DEPTH) != 0;
-                  if (p->tex != ct || dw != cd || nv + 24 > GL_VB_VERTS) { gles_flush(ct, 1, cd, &nv); ct = p->tex; cd = dw; }
-                  nv += gles_build_poly(p, gl_vb + nv * GLV);
-              }
-              gles_flush(ct, 1, cd, &nv);
-              glesr_end((unsigned int *)shim_fb3d);
-              return 1;
-          }
-
           void glFlush(u32 flags)
           {
               (void)flags;
+              shim_trace("glFlush");
+              shim_where = "flush";
               shim_dma_run();
               static int first = 1;
               if (first)
@@ -2345,19 +3203,18 @@ jobs:
                   host_log(m);
                   first = 0;
               }
-              if (!shim_skip_render)
-              {
-                  if (gl_state == 0) gles_probe();
-                  if (gl_state > 0)
-                      render_gles();
-                  shim_last_render = host_ticks_ms();
-              }
+              shim_polys_last = (u32)npoly;
+              u32 t0 = host_ticks_ms();
+              shim_where = "snapshot";
+              gl_snapshot();
+              shim_ms_flush = host_ticks_ms() - t0;
               npoly = nvert = 0;
           }
 
           /* ---------------------------------------------------- misc gl* and status */
           void glInit(void)
           {
+              shim_trace("glInit");
               mat_ident(&cur_pos); mat_ident(&cur_proj); mat_ident(&mvp);
               sp = 0; mvp_dirty = 1; npoly = nvert = 0;
               memset(tex, 0, sizeof tex);
@@ -2369,16 +3226,9 @@ jobs:
           void glClearPolyID(u8 id) { (void)id; }
           void glClearDepth(int d) { clr_depth = d & 0x7FFF; }
           void glFogColor(u8 r, u8 g, u8 b, u8 a) { (void)a; fog_r = r & 31; fog_g = g & 31; fog_b = b & 31; }
-          void glFogShift(int s) { s &= 15; if (s != fog_shift) { fog_shift = s; fog_dirty = 1; } }
-          void glFogOffset(int o) { if (o != fog_off) { fog_off = o; fog_dirty = 1; } }
-          void glFogDensity(int i, int d)
-          {
-              if (i >= 0 && i < 32)
-              {
-                  u8 v = (u8)(d > 127 ? 127 : d);
-                  if (fog_tab[i] != v) { fog_tab[i] = v; fog_dirty = 1; }
-              }
-          }
+          void glFogShift(int s) { fog_shift = s & 15; fog_dirty = 1; }
+          void glFogOffset(int o) { fog_off = o; fog_dirty = 1; }
+          void glFogDensity(int i, int d) { if (i >= 0 && i < 32) { fog_tab[i] = (u8)(d > 127 ? 127 : d); fog_dirty = 1; } }
 
           u32 shim_gfx_status(void) { shim_dma_run(); return 0; }
           u32 shim_poly_ram(void) { shim_dma_run(); return (u32)npoly; }
@@ -2433,7 +3283,6 @@ jobs:
               case 0x22: cu = (s16)p[0]; cv = (s16)(p[0] >> 16); break;
               case 0x23: vertex((s16)p[0], (s16)(p[0] >> 16), (s16)p[1]); break;
               case 0x24: vertex(((int)(p[0] << 22) >> 22) << 6, ((int)(p[0] << 12) >> 22) << 6, ((int)(p[0] << 2) >> 22) << 6); break;
-              case 0x28: vertex(lx + (((int)(p[0] << 22)) >> 22), ly + (((int)(p[0] << 12)) >> 22), lz + (((int)(p[0] << 2)) >> 22)); break;
               case 0x25: vertex((s16)p[0], (s16)(p[0] >> 16), lz); break;
               case 0x26: vertex((s16)p[0], ly, (s16)(p[0] >> 16)); break;
               case 0x27: vertex(lx, (s16)p[0], (s16)(p[0] >> 16)); break;
@@ -2472,6 +3321,7 @@ jobs:
           /* ------------------------------------------------------------------ DMA */
           void shim_dma_run(void)
           {
+              shim_trace("dma");
               for (int again = 1; again;)
               {
                   again = 0;
@@ -2486,6 +3336,7 @@ jobs:
                           for (u32 i = 0; i < words; i++) shim_gx_push(src[i]);
                       if (cr & DMA_IRQ_REQ)
                       {
+                          shim_trace("dma-irq");
                           IntFn f = shim_irq_handler(8 + ch);
                           if (f) { f(); again = 1; }
                       }
@@ -2494,278 +3345,153 @@ jobs:
           }
 
           int dmaBusy(int ch) { (void)ch; shim_dma_run(); return 0; }
-          RE4_EOF
-          cat > symbian/shim/glesr.c <<'RE4_EOF'
-          /* glesr.c - OpenGL ES 2.0 back end for the software GX (gx.c collects and clips the DS polygons;
-             this draws them on the GPU into a 256x192 pbuffer and reads the picture back into shim_fb3d).
-             This file must not include nds.h: that header renames the shim's own gl* functions,
-             whose names are the real GL ones used below. */
-          #include <stdlib.h>
-          #include <string.h>
 
-          int glesr_init(void);
-          void glesr_tex_upload(int id, int w, int h, const unsigned int *argb, int rep_s, int rep_t);
-          void glesr_tex_free(int id);
-          void glesr_fog(const unsigned char *lut, int r, int g, int b);
-          void glesr_begin(int cr, int cg, int cb);
-          void glesr_draw(const float *v, int nv, int tex, int blend, int depthwrite);
-          void glesr_end(unsigned int *out);
+          /* ====================================================================== GLES 2.0 hand-off
+           * In GL mode the polygons are not rasterised here: the clipped polygons are packed into a
+           * triangle list (+ batches of equal state) for the UI thread's GLES 2.0 renderer, and textures
+           * are handed over as ARGB pixel blocks. Everything is integer maths. */
+          #define GL_MAX_VERT (MAX_POLY * 12)
+          static ShimGlVert *glc;                       /* clipped polygon vertices, MAX_POLY * 6 */
+          static ShimGlGeo geo[3];
+          static int geo_ready = -1, geo_reading = -1;
+          static unsigned geo_seq;
 
+          typedef struct TexNode { ShimGlTexEv ev; struct TexNode *next; } TexNode;
+          static TexNode *tex_head, *tex_tail;
 
-          typedef unsigned int GLenum, GLuint, GLbitfield;
-          typedef int GLint, GLsizei;
-          typedef unsigned char GLboolean;
-          typedef float GLfloat;
-          typedef char GLchar;
-          typedef void *EGLDisplay, *EGLConfig, *EGLSurface, *EGLContext;
-          typedef int EGLint;
-          typedef unsigned int EGLBoolean;
-
-          EGLDisplay eglGetDisplay(void *id);
-          EGLBoolean eglInitialize(EGLDisplay d, EGLint *major, EGLint *minor);
-          EGLBoolean eglBindAPI(unsigned int api);
-          EGLBoolean eglChooseConfig(EGLDisplay d, const EGLint *attr, EGLConfig *cfg, EGLint size, EGLint *num);
-          EGLSurface eglCreatePbufferSurface(EGLDisplay d, EGLConfig cfg, const EGLint *attr);
-          EGLContext eglCreateContext(EGLDisplay d, EGLConfig cfg, EGLContext share, const EGLint *attr);
-          EGLBoolean eglMakeCurrent(EGLDisplay d, EGLSurface draw, EGLSurface read, EGLContext ctx);
-
-          GLuint glCreateShader(GLenum type);
-          void glShaderSource(GLuint s, GLsizei count, const GLchar *const *src, const GLint *len);
-          void glCompileShader(GLuint s);
-          void glGetShaderiv(GLuint s, GLenum pname, GLint *p);
-          GLuint glCreateProgram(void);
-          void glAttachShader(GLuint p, GLuint s);
-          void glBindAttribLocation(GLuint p, GLuint i, const GLchar *name);
-          void glLinkProgram(GLuint p);
-          void glGetProgramiv(GLuint p, GLenum pname, GLint *v);
-          void glUseProgram(GLuint p);
-          GLint glGetUniformLocation(GLuint p, const GLchar *name);
-          void glUniform1i(GLint loc, GLint v);
-          void glUniform3f(GLint loc, GLfloat a, GLfloat b, GLfloat c);
-          void glEnableVertexAttribArray(GLuint i);
-          void glVertexAttribPointer(GLuint i, GLint size, GLenum type, GLboolean norm, GLsizei stride, const void *ptr);
-          void glDrawArrays(GLenum mode, GLint first, GLsizei count);
-          void glGenTextures(GLsizei n, GLuint *t);
-          void glDeleteTextures(GLsizei n, const GLuint *t);
-          void glBindTexture(GLenum target, GLuint t);
-          void glActiveTexture(GLenum unit);
-          void glTexParameteri(GLenum target, GLenum pname, GLint v);
-          void glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h, GLint border, GLenum fmt, GLenum type, const void *px);
-          void glPixelStorei(GLenum pname, GLint v);
-          void glViewport(GLint x, GLint y, GLsizei w, GLsizei h);
-          void glClearColor(GLfloat r, GLfloat g, GLfloat b, GLfloat a);
-          void glClearDepthf(GLfloat d);
-          void glClear(GLbitfield m);
-          void glEnable(GLenum cap);
-          void glDisable(GLenum cap);
-          void glDepthFunc(GLenum f);
-          void glDepthMask(GLboolean m);
-          void glBlendFunc(GLenum s, GLenum d);
-          void glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum fmt, GLenum type, void *px);
-
-          #define GLV 11                         /* floats per vertex: pos4 uv2 colour+alpha4 fog1 */
-          #define MAXT 640
-
-          static GLuint prog, white_tex, fog_tex, gl_tex[MAXT];
-          static GLint loc_tex, loc_fog, loc_fogc;
-          static float fog_c[3];
-          static unsigned char *rb;
-
-          static const char *vs_src =
-              "attribute vec4 a_pos;\n"
-              "attribute vec2 a_uv;\n"
-              "attribute vec4 a_col;\n"
-              "attribute float a_fog;\n"
-              "varying vec2 v_uv;\n"
-              "varying vec4 v_col;\n"
-              "varying float v_fog;\n"
-              "void main() { gl_Position = a_pos; v_uv = a_uv; v_col = a_col; v_fog = a_fog; }\n";
-
-          static const char *fs_src =
-              "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
-              "precision highp float;\n"
-              "#else\n"
-              "precision mediump float;\n"
-              "#endif\n"
-              "uniform sampler2D u_tex;\n"
-              "uniform sampler2D u_fogtab;\n"
-              "uniform vec3 u_fogc;\n"
-              "varying vec2 v_uv;\n"
-              "varying vec4 v_col;\n"
-              "varying float v_fog;\n"
-              "void main() {\n"
-              "  vec4 t = texture2D(u_tex, v_uv);\n"
-              "  if (t.a < 0.01) discard;\n"
-              "  vec3 c = t.rgb * v_col.rgb;\n"
-              "  float a = v_col.a;\n"
-              "  if (t.a < 0.97) a *= t.a;\n"
-              "  if (v_fog > 0.5) {\n"
-              "    float zi = floor(gl_FragCoord.z * 32767.0 + 0.5);\n"
-              "    float row = floor(zi / 256.0);\n"
-              "    float col = zi - row * 256.0;\n"
-              "    float f = texture2D(u_fogtab, vec2((col + 0.5) / 256.0, (row + 0.5) / 128.0)).r * 0.9961;\n"
-              "    c = mix(c, u_fogc, f);\n"
-              "  }\n"
-              "  gl_FragColor = vec4(c, a);\n"
-              "}\n";
-
-          static GLuint compile(GLenum type, const char *src)
+          int shim_gl_enable(void)
           {
-              GLuint s = glCreateShader(type);
-              GLint ok = 0;
-              if (!s) return 0;
-              glShaderSource(s, 1, &src, 0);
-              glCompileShader(s);
-              glGetShaderiv(s, 0x8B81, &ok);            /* GL_COMPILE_STATUS */
-              return ok ? s : 0;
+              if (shim_gl_mode) return 1;
+              glc = (ShimGlVert *)malloc(sizeof(ShimGlVert) * MAX_POLY * 6);
+              int ok = glc != 0;
+              for (int k = 0; k < 3 && ok; k++)
+              {
+                  geo[k].v = (ShimGlVert *)malloc(sizeof(ShimGlVert) * GL_MAX_VERT);
+                  geo[k].b = (ShimGlBatch *)malloc(sizeof(ShimGlBatch) * MAX_POLY);
+                  ok = geo[k].v && geo[k].b;
+              }
+              if (!ok) return 0;
+              shim_gl_mode = 1;
+              return 1;
           }
 
-          static void new_tex(GLuint *t)
+          static void tex_push(int kind, int id, int w, int h, int ws, int wt, u32 *px)
           {
-              glGenTextures(1, t);
-              glBindTexture(0x0DE1, *t);
-              glTexParameteri(0x0DE1, 0x2800, 0x2600);  /* MAG, NEAREST */
-              glTexParameteri(0x0DE1, 0x2801, 0x2600);  /* MIN, NEAREST */
-              glTexParameteri(0x0DE1, 0x2802, 0x812F);  /* clamp to edge */
-              glTexParameteri(0x0DE1, 0x2803, 0x812F);
+              TexNode *n = (TexNode *)malloc(sizeof(TexNode));
+              if (!n) { if (px) free(px); return; }
+              n->ev.kind = kind; n->ev.id = id; n->ev.w = w; n->ev.h = h; n->ev.wrap_s = ws; n->ev.wrap_t = wt; n->ev.px = px;
+              n->next = 0;
+              host_lock();
+              if (tex_tail) tex_tail->next = n; else tex_head = n;
+              tex_tail = n;
+              host_unlock();
           }
 
-          int glesr_init(void)
+          static void tex_ready(int id)
           {
-              EGLint maj, min, n = 0;
-              EGLConfig cfg;
-              EGLDisplay d = eglGetDisplay((void *)0);
-              if (!d || !eglInitialize(d, &maj, &min)) return 0;
-              if (!eglBindAPI(0x30A0)) return 0;                                   /* EGL_OPENGL_ES_API */
+              Tex *t = &tex[id];
+              t->ready = 1;
+              if (shim_gl_mode)
               {
-                  const EGLint ca[] = { 0x3033, 1, 0x3040, 4, 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3025, 16, 0x3038 };
-                  if (!eglChooseConfig(d, ca, &cfg, 1, &n) || n < 1) return 0;
-              }
-              {
-                  const EGLint pa[] = { 0x3057, 256, 0x3056, 192, 0x3038 };
-                  const EGLint xa[] = { 0x3098, 2, 0x3038 };
-                  EGLSurface s = eglCreatePbufferSurface(d, cfg, pa);
-                  EGLContext c;
-                  if (!s) return 0;
-                  c = eglCreateContext(d, cfg, (void *)0, xa);
-                  if (!c || !eglMakeCurrent(d, s, s, c)) return 0;
-              }
-              {
-                  GLuint vs = compile(0x8B31, vs_src), fs = compile(0x8B30, fs_src);
-                  GLint ok = 0;
-                  if (!vs || !fs) return 0;
-                  prog = glCreateProgram();
-                  glAttachShader(prog, vs);
-                  glAttachShader(prog, fs);
-                  glBindAttribLocation(prog, 0, "a_pos");
-                  glBindAttribLocation(prog, 1, "a_uv");
-                  glBindAttribLocation(prog, 2, "a_col");
-                  glBindAttribLocation(prog, 3, "a_fog");
-                  glLinkProgram(prog);
-                  glGetProgramiv(prog, 0x8B82, &ok);                               /* GL_LINK_STATUS */
-                  if (!ok) return 0;
-              }
-              glUseProgram(prog);
-              loc_tex = glGetUniformLocation(prog, "u_tex");
-              loc_fog = glGetUniformLocation(prog, "u_fogtab");
-              loc_fogc = glGetUniformLocation(prog, "u_fogc");
-              glPixelStorei(0x0CF5, 1);                                            /* unpack alignment */
-              {
-                  static const unsigned char white[4] = { 255, 255, 255, 255 };
-                  new_tex(&white_tex);
-                  glTexImage2D(0x0DE1, 0, 0x1908, 1, 1, 0, 0x1908, 0x1401, white);
-                  new_tex(&fog_tex);
-              }
-              rb = (unsigned char *)malloc(256 * 192 * 4);
-              return rb != 0;
-          }
-
-          void glesr_tex_upload(int id, int w, int h, const unsigned int *argb, int rep_s, int rep_t)
-          {
-              unsigned char *t;
-              int n = w * h;
-              if (id <= 0 || id >= MAXT || !argb) return;
-              t = (unsigned char *)malloc((size_t)n * 4);
-              if (!t) return;
-              for (int i = 0; i < n; i++)
-              {
-                  unsigned int c = argb[i];
-                  t[i * 4] = (unsigned char)(c >> 16);
-                  t[i * 4 + 1] = (unsigned char)(c >> 8);
-                  t[i * 4 + 2] = (unsigned char)c;
-                  t[i * 4 + 3] = (unsigned char)(c >> 24);
-              }
-              if (!gl_tex[id]) new_tex(&gl_tex[id]);
-              glBindTexture(0x0DE1, gl_tex[id]);
-              glTexParameteri(0x0DE1, 0x2802, rep_s ? 0x2901 : 0x812F);
-              glTexParameteri(0x0DE1, 0x2803, rep_t ? 0x2901 : 0x812F);
-              glTexImage2D(0x0DE1, 0, 0x1908, w, h, 0, 0x1908, 0x1401, t);
-              free(t);
-          }
-
-          void glesr_tex_free(int id)
-          {
-              if (id > 0 && id < MAXT && gl_tex[id])
-              {
-                  glDeleteTextures(1, &gl_tex[id]);
-                  gl_tex[id] = 0;
+                  tex_push(1, id, t->w, t->h, t->wrap_s, t->wrap_t, t->px);
+                  t->px = 0;                  /* ownership moved to the GL thread */
               }
           }
 
-          void glesr_fog(const unsigned char *lut, int r, int g, int b)
+          int shim_gl_next_tex(ShimGlTexEv *ev)
           {
-              fog_c[0] = r / 255.0f; fog_c[1] = g / 255.0f; fog_c[2] = b / 255.0f;
-              if (lut)
+              host_lock();
+              TexNode *n = tex_head;
+              if (n) { tex_head = n->next; if (!tex_head) tex_tail = 0; }
+              host_unlock();
+              if (!n) return 0;
+              *ev = n->ev;
+              free(n);
+              return 1;
+          }
+
+          /* float bits of  v / 2^shift  without any floating point */
+          static unsigned i2f(int v, int shift)
+          {
+              if (!v) return 0;
+              unsigned sign = 0, a = (unsigned)v;
+              if (v < 0) { sign = 0x80000000u; a = 0u - (unsigned)v; }
+              int n = 31 - __builtin_clz(a);
+              unsigned m = n <= 23 ? (a << (23 - n)) : (a >> (n - 23));
+              return sign | ((unsigned)(n - shift + 127) << 23) | (m & 0x7FFFFF);
+          }
+
+          static void gl_store(int idx, const CV *a, int m, const Poly *p)
+          {
+              if (!glc) return;
+              int alpha = (p->attr >> 16) & 31;
+              unsigned char a8 = (unsigned char)(alpha * 255 / 31);
+              int lw = 0, lh = 0;
+              if (p->tex) { lw = tex[p->tex].lw; lh = tex[p->tex].lh; }
+              for (int i = 0; i < m && i < 6; i++)
               {
-                  unsigned char *t = (unsigned char *)malloc(0x8000);
-                  if (!t) return;
-                  for (int i = 0; i < 0x8000; i++) t[i] = (unsigned char)(lut[i] * 2);
-                  glBindTexture(0x0DE1, fog_tex);
-                  glTexImage2D(0x0DE1, 0, 0x1909, 256, 128, 0, 0x1909, 0x1401, t);   /* LUMINANCE */
-                  free(t);
+                  ShimGlVert *o = &glc[idx * 6 + i];
+                  o->x = i2f(a[i].x, 12); o->y = i2f(a[i].y, 12); o->z = i2f(a[i].z, 12); o->w = i2f(a[i].w, 12);
+                  o->u = i2f(a[i].u, 4 + lw); o->v = i2f(a[i].v, 4 + lh);
+                  o->r = (unsigned char)(a[i].r << 3 | a[i].r >> 2);
+                  o->g = (unsigned char)(a[i].g << 3 | a[i].g >> 2);
+                  o->b = (unsigned char)(a[i].b << 3 | a[i].b >> 2);
+                  o->a = a8;
               }
           }
 
-          void glesr_begin(int cr, int cg, int cb)
+          static void gl_snapshot(void)
           {
-              glUseProgram(prog);
-              glViewport(0, 0, 256, 192);
-              glEnable(0x0B71);                                                    /* depth test */
-              glDepthFunc(0x0201);                                                 /* LESS */
-              glDepthMask(1);
-              glDisable(0x0BE2);                                                   /* blend */
-              glDisable(0x0B44);                                                   /* cull face */
-              glClearColor((cr << 3 | cr >> 2) / 255.0f, (cg << 3 | cg >> 2) / 255.0f, (cb << 3 | cb >> 2) / 255.0f, 1.0f);
-              glClearDepthf(1.0f);
-              glClear(0x4100);                                                     /* colour + depth */
-              glUniform1i(loc_tex, 0);
-              glUniform1i(loc_fog, 1);
-              glUniform3f(loc_fogc, fog_c[0], fog_c[1], fog_c[2]);
-              glActiveTexture(0x84C1);
-              glBindTexture(0x0DE1, fog_tex);
-              glActiveTexture(0x84C0);
-              for (int i = 0; i < 4; i++) glEnableVertexAttribArray(i);
+              if (!glc) return;
+              if (fog_dirty) rebuild_fog();
+              host_lock();
+              int w = 0;
+              while (w == geo_ready || w == geo_reading) w++;      /* three buffers: always one is free */
+              host_unlock();
+              ShimGlGeo *g = &geo[w];
+              int nv = 0, nb = 0;
+              for (int pass = 0; pass < 2; pass++)
+                  for (int i = 0; i < npoly; i++)
+                  {
+                      const Poly *p = &polys[i];
+                      if (p->trans != pass || p->line) continue;
+                      unsigned flags = (p->trans ? SHIM_GLB_TRANS : 0) | ((fog_on && (p->attr & POLY_FOG)) ? SHIM_GLB_FOG : 0) |
+                                       ((!p->trans || (p->attr & POLY_NEW_DEPTH)) ? SHIM_GLB_DEPTHW : 0) |
+                                       ((p->attr & POLY_DEPTHTEST_EQUAL) ? SHIM_GLB_DEQ : 0);
+                      int tris = p->n - 2;
+                      if (tris < 1 || nv + tris * 3 > GL_MAX_VERT) continue;
+                      if (nb > 0 && g->b[nb - 1].tex == p->tex && g->b[nb - 1].flags == flags)
+                          g->b[nb - 1].count += tris * 3;
+                      else
+                      {
+                          g->b[nb].first = nv; g->b[nb].count = tris * 3; g->b[nb].tex = p->tex; g->b[nb].flags = flags;
+                          nb++;
+                      }
+                      const ShimGlVert *c = &glc[i * 6];
+                      for (int k = 1; k <= tris; k++)
+                      {
+                          g->v[nv++] = c[0]; g->v[nv++] = c[k]; g->v[nv++] = c[k + 1];
+                      }
+                  }
+              g->nv = nv; g->nb = nb;
+              g->clr[0] = clr_r; g->clr[1] = clr_g; g->clr[2] = clr_b;
+              g->clr_depth = (unsigned short)clr_depth;
+              g->fog_on = (unsigned char)fog_on;
+              g->fog_col[0] = fog_r; g->fog_col[1] = fog_g; g->fog_col[2] = fog_b;
+              for (int i = 0; i < 512; i++) g->fog_lut[i] = (unsigned char)(fog_lut[i * 64] * 2);
+              g->seq = ++geo_seq;
+              host_lock();
+              geo_ready = w;
+              host_unlock();
           }
 
-          void glesr_draw(const float *v, int nv, int tex, int blend, int depthwrite)
+          const ShimGlGeo *shim_gl_acquire(void)
           {
-              const GLsizei stride = GLV * 4;
-              glBindTexture(0x0DE1, (tex > 0 && tex < MAXT && gl_tex[tex]) ? gl_tex[tex] : white_tex);
-              if (blend) { glEnable(0x0BE2); glBlendFunc(0x0302, 0x0303); } else glDisable(0x0BE2);
-              glDepthMask(depthwrite ? 1 : 0);
-              glVertexAttribPointer(0, 4, 0x1406, 0, stride, v);
-              glVertexAttribPointer(1, 2, 0x1406, 0, stride, v + 4);
-              glVertexAttribPointer(2, 4, 0x1406, 0, stride, v + 6);
-              glVertexAttribPointer(3, 1, 0x1406, 0, stride, v + 10);
-              glDrawArrays(4, 0, nv);                                              /* GL_TRIANGLES */
-          }
-
-          void glesr_end(unsigned int *out)
-          {
-              glDepthMask(1);
-              glReadPixels(0, 0, 256, 192, 0x1908, 0x1401, rb);
-              for (int i = 0; i < 256 * 192; i++)
-                  out[i] = (unsigned int)rb[i * 4] << 16 | (unsigned int)rb[i * 4 + 1] << 8 | rb[i * 4 + 2];
+              host_lock();
+              geo_reading = geo_ready;
+              int r = geo_ready;
+              host_unlock();
+              return r < 0 ? 0 : &geo[r];
           }
           RE4_EOF
           mkdir -p symbian/shim/libc
@@ -2960,16 +3686,6 @@ jobs:
           #endif
 
           #define main re4_main       /* the game's main() becomes the worker-thread entry */
-
-          /* the DS names that are also OpenGL ES names: renamed, so the GLES2 back end (glesr.c) can link the real ones */
-          #define glGenTextures    shim_glGenTextures
-          #define glDeleteTextures shim_glDeleteTextures
-          #define glBindTexture    shim_glBindTexture
-          #define glClearColor     shim_glClearColor
-          #define glEnable         shim_glEnable
-          #define glDisable        shim_glDisable
-          #define glViewport       shim_glViewport
-          #define glFlush          shim_glFlush
 
           typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
           typedef int8_t s8; typedef int16_t s16; typedef int32_t s32; typedef int64_t s64;
@@ -3197,6 +3913,12 @@ jobs:
           extern u32 shim_top[256 * 192];        /* presented frames, 0x00RRGGBB */
           extern u32 shim_bot[256 * 192];
           extern volatile u32 shim_frame_no;
+          extern const char *volatile shim_where;     /* what the game thread was last doing (for the stall watchdog) */
+          extern volatile u32 shim_ms_flush, shim_ms_present, shim_polys_last;
+          extern volatile u32 shim_ui_ticks;           /* bumped by the UI thread: lets the game thread see a frozen UI */
+          void shim_trace(const char *name);           /* ring buffer of the last API calls (watchdog dumps it) */
+          int shim_trace_dump(char *buf, int cap);
+          int shim_trace_tail(char *buf, int cap, int n);
           extern char shim_console[2048];
           extern volatile int shim_console_on;
           void shim_set_input(u32 keys, int touch_down, int tx, int ty);   /* any thread */
@@ -3243,19 +3965,13 @@ jobs:
           int host_remove(const char *path);
           int host_rename(const char *a, const char *b);
           unsigned host_ticks_ms(void);
+          void shim_trace(const char *name);
           void host_exit_thread(void);
 
           /* ----------------------------------------------------------------- string */
           __attribute__((weak)) void *memcpy(void *d, const void *s, size_t n)
           {
               unsigned char *a = (unsigned char *)d; const unsigned char *b = (const unsigned char *)s;
-              if ((((unsigned long)a | (unsigned long)b) & 3) == 0)
-              {
-                  unsigned *wa = (unsigned *)a; const unsigned *wb = (const unsigned *)b;
-                  for (; n >= 16; n -= 16) { wa[0] = wb[0]; wa[1] = wb[1]; wa[2] = wb[2]; wa[3] = wb[3]; wa += 4; wb += 4; }
-                  for (; n >= 4; n -= 4) *wa++ = *wb++;
-                  a = (unsigned char *)wa; b = (const unsigned char *)wb;
-              }
               while (n--) *a++ = *b++;
               return d;
           }
@@ -3269,15 +3985,7 @@ jobs:
           __attribute__((weak)) void *memset(void *d, int c, size_t n)
           {
               unsigned char *a = (unsigned char *)d;
-              unsigned char v = (unsigned char)c;
-              if ((((unsigned long)a) & 3) == 0)
-              {
-                  unsigned w = v * 0x01010101u, *wa = (unsigned *)a;
-                  for (; n >= 16; n -= 16) { wa[0] = w; wa[1] = w; wa[2] = w; wa[3] = w; wa += 4; }
-                  for (; n >= 4; n -= 4) *wa++ = w;
-                  a = (unsigned char *)wa;
-              }
-              while (n--) *a++ = v;
+              while (n--) *a++ = (unsigned char)c;
               return d;
           }
           __attribute__((weak)) int memcmp(const void *x, const void *y, size_t n)
@@ -3304,7 +4012,11 @@ jobs:
           char *strchr(const char *s, int c) { for (; *s; s++) if (*s == (char)c) return (char *)s; return c == 0 ? (char *)s : 0; }
 
           /* ----------------------------------------------------------------- stdlib */
-          void *malloc(size_t n) { return host_alloc(n ? n : 1); }
+          void *malloc(size_t n)
+          {
+              if (n >= 65536) shim_trace("malloc-big");
+              return host_alloc(n ? n : 1);
+          }
           void *calloc(size_t a, size_t b) { size_t n = a * b; void *p = host_alloc(n ? n : 1); if (p) memset(p, 0, n); return p; }
           void *realloc(void *p, size_t n) { return p ? host_realloc(p, n) : host_alloc(n ? n : 1); }
           void free(void *p) { if (p) host_free(p); }
@@ -3328,6 +4040,7 @@ jobs:
           struct ShimFile { int h; };
           FILE *fopen(const char *path, const char *mode)
           {
+              shim_trace("fopen");
               int h = host_fopen(path, mode);
               if (h < 0) return 0;
               FILE *f = (FILE *)malloc(sizeof(FILE));
@@ -3335,15 +4048,17 @@ jobs:
               f->h = h;
               return f;
           }
-          int fclose(FILE *f) { if (!f) return -1; host_fclose(f->h); free(f); return 0; }
+          int fclose(FILE *f) { shim_trace("fclose"); if (!f) return -1; host_fclose(f->h); free(f); return 0; }
           size_t fread(void *b, size_t s, size_t n, FILE *f)
           {
+              shim_trace("fread");
               if (!f || !s || !n) return 0;
               int got = host_fread(f->h, b, (int)(s * n));
               return got <= 0 ? 0 : (size_t)got / s;
           }
           size_t fwrite(const void *b, size_t s, size_t n, FILE *f)
           {
+              shim_trace("fwrite");
               if (!f || !s || !n) return 0;
               int put = host_fwrite(f->h, b, (int)(s * n));
               return put <= 0 ? 0 : (size_t)put / s;
@@ -3513,7 +4228,7 @@ jobs:
           mkdir -p symbian/tools
           cat > symbian/tools/host_check.sh <<'RE4_EOF'
           #!/bin/bash
-          # Host build of the whole game against the shim (the OpenGL ES side is stubbed on the host). Run from the repo root
+          # Host build of the whole game against the shim + a rasterizer smoke test. Run from the repo root
           # after tools/prepare.sh.
           set -euo pipefail
           S=symbian/shim
@@ -3523,7 +4238,7 @@ jobs:
             gcc $CF -c "$f" -o "/tmp/hc/$(basename "$f").o"
           done
           # 32-bit, freestanding (-nostdinc + our own libc headers): what the Symbian compiler will see
-          for f in symbian/build_src/*.c $S/dsshim.c $S/gx.c $S/glesr.c $S/rt.c symbian/gen/databins.c; do
+          for f in symbian/build_src/*.c $S/dsshim.c $S/gx.c $S/rt.c symbian/gen/databins.c; do
             gcc -m32 -std=gnu11 -O2 -fsyntax-only -Wno-unused -Wno-misleading-indentation -fno-strict-aliasing \
                 -nostdinc -isystem $S/libc -I$S -Isymbian/gen -Isymbian/build_src "$f"
           done
@@ -3531,6 +4246,9 @@ jobs:
           # whole game links against the shim (main is provided by the stub file)
           gcc -o /tmp/hc/game /tmp/hc/*.o -lm
           echo "game + shim link OK"
+          gcc $CF -c symbian/tools/render_test.c -o /tmp/hc/render_test.o
+          gcc -o /tmp/hc/render_test /tmp/hc/render_test.o /tmp/hc/dsshim.c.o /tmp/hc/gx.c.o /tmp/hc/host_stubs.c.o -lm
+          /tmp/hc/render_test
           RE4_EOF
           mkdir -p symbian/tools
           cat > symbian/tools/host_stubs.c <<'RE4_EOF'
@@ -3542,14 +4260,6 @@ jobs:
           void host_lock(void) {}
           void host_unlock(void) {}
           void host_log(const char *m) { (void)m; }
-          /* OpenGL ES 2.0 back end (glesr.c, needs the phone's GPU): not on the host */
-          int glesr_init(void) { return 0; }
-          void glesr_tex_upload(int id, int w, int h, const unsigned int *argb, int rep_s, int rep_t) { (void)id; (void)w; (void)h; (void)argb; (void)rep_s; (void)rep_t; }
-          void glesr_tex_free(int id) { (void)id; }
-          void glesr_fog(const unsigned char *lut, int r, int g, int b) { (void)lut; (void)r; (void)g; (void)b; }
-          void glesr_begin(int cr, int cg, int cb) { (void)cr; (void)cg; (void)cb; }
-          void glesr_draw(const float *v, int nv, int tex, int blend, int depthwrite) { (void)v; (void)nv; (void)tex; (void)blend; (void)depthwrite; }
-          void glesr_end(unsigned int *out) { (void)out; }
           RE4_EOF
           mkdir -p symbian/tools
           cat > symbian/tools/prepare.sh <<'RE4_EOF'
@@ -3574,13 +4284,6 @@ jobs:
           #    time here, so the table must be built at run time too
           grep -q 'static const void \*const data\[\] = { title_bin' "$OUT/main.c" || { echo "patch 2 target missing"; exit 1; }
           sed -i 's/static const void \*const data\[\] = { title_bin/const void *data[] = { title_bin/; s/static const size_t size\[\] = { title_bin_size/const size_t size[] = { title_bin_size/' "$OUT/main.c"
-
-          # 2b. model_sync() waits with  while (chain_at < chain_n || dmaBusy(..))  : on the DS the DMA2
-          #     interrupt advances chain_at, here only shim_dma_run() (called from dmaBusy) does. With
-          #     chain_at < chain_n the || short-circuits, dmaBusy is never called and the first gameplay
-          #     frame of a chunked stage spins forever. Call dmaBusy first so the chain is always pumped.
-          grep -q 'while (chain_at < chain_n || dmaBusy(ASYNC_DMA))' "$OUT/model.c" || { echo "patch 2b target missing"; exit 1; }
-          sed -i 's/while (chain_at < chain_n || dmaBusy(ASYNC_DMA))/while (dmaBusy(ASYNC_DMA) || chain_at < chain_n)/' "$OUT/model.c"
 
           # 3. data blobs: every  #include "NAME_bin.h"  becomes a pointer + size loaded from data/NAME.bin
           names=$(grep -h '#include "[A-Za-z0-9_]*_bin.h"' "$OUT"/*.c | sed 's/.*"\(.*\)_bin\.h".*/\1/' | sort -u)
@@ -3626,8 +4329,6 @@ jobs:
           }
           CEOF
           } > "$GEN/databins.c"
-          # 3b. the floor under Leon is never dropped by the stage budget
-          python3 symbian/tools/fix_floor.py "$OUT"
           # 4. the .mmp: the game's C files are listed from what is actually in ds/source
           srcs=$(cd "$OUT" && ls *.c | sed 's/^/SOURCE          /')
           awk -v list="$srcs" '{ if ($0 == "@GAME_SOURCES@") print list; else print }' symbian/group/re4ds.mmp.in > symbian/group/re4ds.mmp
@@ -3636,18 +4337,20 @@ jobs:
           RE4_EOF
           mkdir -p symbian/tools
           cat > symbian/tools/render_test.c <<'RE4_EOF'
-          // render_test.c - smoke test of the software GX: perspective texture, translucency, depth.
+          // render_test.c - smoke test of the GX front end + GLES hand-off: matrices, clipping, polygon
+          // buffer, texture hand-over, batching, alpha, uv, depth/fog flags.
           #include <nds.h>
           #undef main
           #include <stdio.h>
+          #include <string.h>
+          #include "gl_iface.h"
 
           static int fails;
-          #define CHECK(c, msg) do { if (!(c)) { printf_host("FAIL: %s\n", msg); fails++; } } while (0)
-          #undef printf
-          #define printf_host(...) fprintf(stderr, __VA_ARGS__)
+          #define CHECK(c, msg) do { if (!(c)) { fprintf(stderr, "FAIL: %s\n", msg); fails++; } } while (0)
 
           int main(void)
           {
+              CHECK(shim_gl_enable() == 1, "gl mode enabled");
               glInit();
               glClearColor(8, 12, 20, 31);
               glClearDepth(0x7FFF);
@@ -3659,6 +4362,12 @@ jobs:
               static u16 pal[256] = { 0, RGB15(31, 31, 0), RGB15(0, 10, 31) };
               glTexImageNtr2D(GL_RGB256, 64, 64, GL_TEXTURE_WRAP_S | GL_TEXTURE_WRAP_T | TEXGEN_TEXCOORD, tx, 0);
               glColorTableNtr(3, pal);
+              ShimGlTexEv ev;
+              CHECK(shim_gl_next_tex(&ev) == 1 && ev.kind == 1 && ev.id == n && ev.w == 64 && ev.h == 64 && ev.px != 0, "texture upload event");
+              CHECK(ev.px && (ev.px[0] >> 24) == 255, "texel alpha 255");
+              CHECK(ev.px && (ev.px[1] & 0xFFFFFF) == 0x0052FF && (ev.px[8] & 0xFFFFFF) == 0xFFFF00, "palette colours decoded");
+              CHECK(shim_gl_next_tex(&ev) == 0, "no more events");
+
               glMatrixMode(GL_PROJECTION); glLoadIdentity();
               gluPerspectivef32(degreesToAngle(70), floattof32(256.0 / 192), floattof32(1), floattof32(700));
               glMatrixMode(GL_MODELVIEW); glLoadIdentity();
@@ -3671,198 +4380,38 @@ jobs:
               glTexCoord2t16(0, inttot16(64));              glVertex3v16(-inttov16(7), 0, inttov16(7));
               glEnd();
               glBindTexture(0, 0);
-              glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE);
+              glPolyFmt(POLY_ALPHA(16) | POLY_CULL_NONE | POLY_FOG);
               glBegin(GL_TRIANGLES); glColor(RGB15(31, 0, 0));
               glVertex3v16(-inttov16(2), inttov16(3), 0); glVertex3v16(inttov16(2), inttov16(3), 0); glVertex3v16(0, 0, inttov16(1));
               glEnd();
               CHECK(GFX_POLYGON_RAM_USAGE == 2, "two polygons counted");
               glFlush(0);
-              swiWaitForVBlank();
-              u32 sky = shim_top[10 * 256 + 10];
-              CHECK(sky == 0x4263A5, "sky = clear colour");
-              u32 f = shim_top[180 * 256 + 128];
-              CHECK(f == 0xFFFF00 || f == 0x0052FF, "floor pixel is a checker colour");
-              u32 t = shim_top[60 * 256 + 128];
-              CHECK(((t >> 16) & 255) > ((t >> 8) & 255) + 30, "translucent red triangle over the sky");
-              int distinct = 0;
-              for (int x = 0; x < 256; x++) if (shim_top[170 * 256 + x] != shim_top[170 * 256 + (x ? x - 1 : 0)]) distinct++;
-              CHECK(distinct >= 2, "checker pattern visible along a floor scanline");
+              const ShimGlGeo *g = shim_gl_acquire();
+              CHECK(g != 0, "geometry frame available");
+              if (g)
+              {
+                  CHECK(g->nv == 9, "9 vertices (quad = 2 triangles + 1 triangle)");
+                  CHECK(g->nb == 2, "2 batches");
+                  if (g->nb == 2)
+                  {
+                      CHECK(g->b[0].tex == n && g->b[0].flags == SHIM_GLB_DEPTHW && g->b[0].count == 6, "opaque textured batch");
+                      CHECK(g->b[1].tex == 0 && (g->b[1].flags & SHIM_GLB_TRANS) && !(g->b[1].flags & SHIM_GLB_DEPTHW) && g->b[1].count == 3, "translucent batch, no depth write");
+                  }
+                  float u1, w0;
+                  memcpy(&u1, &g->v[1].u, 4);          /* second vertex of the quad = (64,0) texels -> u = 1.0 */
+                  memcpy(&w0, &g->v[0].w, 4);
+                  CHECK(u1 > 0.999f && u1 < 1.001f, "u of the 2nd corner is 1.0");
+                  CHECK(w0 > 1.0f && w0 < 20.0f, "clip w is a sensible distance");
+                  CHECK(g->v[0].a == 255 && g->v[6].a < 140 && g->v[6].a > 120, "alpha 31 -> 255, 16 -> ~132");
+                  CHECK(g->clr[0] == 8 && g->clr[1] == 12 && g->clr[2] == 20 && g->clr_depth == 0x7FFF, "clear colour / depth passed on");
+              }
+              /* the next frame starts empty */
+              glFlush(0);
+              g = shim_gl_acquire();
+              CHECK(g && g->nv == 0 && g->nb == 0, "second frame is empty");
               fprintf(stderr, fails ? "render test FAILED\n" : "render test OK\n");
               return fails ? 1 : 0;
           }
-          RE4_EOF
-          mkdir -p symbian/tools
-          cat > symbian/tools/fix_floor.py <<'RE4_EOF'
-          #!/usr/bin/env python3
-          # fix_floor.py <build_src>: the floor under Leon is never what the stage's triangle budget drops
-          # (model_draw_near sends the chunk Leon stands on first, outside the budget).
-          import sys
-          d = sys.argv[1]
-          def rd(n): return open(d + '/' + n).read()
-          def wr(n, s): open(d + '/' + n, 'w').write(s)
-          def rep(t, old, new):
-              assert t.count(old) == 1, old
-              return t.replace(old, new)
-
-          h = rd('model.h')
-          h = rep(h, "// Waits until a model_draw_async() transfer has finished.", """// The floor under the player: model_draw_near() always sends the chunk(s) holding this point
-          // (f32 x, y = feet, z) first and outside the triangle budget (up to a cap). NULL: none.
-          void model_set_anchor(const int p[3]);
-
-          // Waits until a model_draw_async() transfer has finished.""")
-          wr('model.h', h)
-
-          c = rd('model.c')
-          a = c.index("void model_draw_near(Model *m")
-          b = c.index("void model_sync(void)")
-          NEW = r"""static int anchor_on, anchor_pos[3];
-          #define ANCHOR_TRI_MAX 900            // the floor's own share, outside the budget
-          #define ANCHOR_FIRST_MAX 1500         // (the first one is taken whatever the cap)
-          #define ANCHOR_Y_MARGIN inttof32(8)
-
-          void model_set_anchor(const int p[3])
-          {
-              anchor_on = p != NULL;
-              if (p)
-                  memcpy(anchor_pos, p, sizeof(anchor_pos));
-          }
-
-          static void chain_add(const Model *m, int i, int *n)
-          {
-              u32 from = i ? m->draws[i - 1].list_at : 0;
-              chain[*n].src = m->async_list + from;
-              chain[(*n)++].words = m->draws[i].list_at - from;
-          }
-
-          void model_draw_near(Model *m, const int eye[3], const int at[3], int budget, u32 poly_fmt)
-          {
-              static int irq_set;
-              static s16 head[NEAR_BUCKETS], next[MODEL_MAX_DRAWS];
-              static u8 anchor_of[MODEL_MAX_DRAWS], taken[MODEL_MAX_DRAWS];
-              model_sync();
-              if (!irq_set)
-              {
-                  irqSet(IRQ_DMA2, chain_next);
-                  irqEnable(IRQ_DMA2);
-                  irq_set = 1;
-              }
-              if (!m->async_list || m->async_fmt != poly_fmt)
-                  model_build_async(m, poly_fmt);
-              glPushMatrix();
-              glTranslatef32(m->center[0], m->center[1], m->center[2]);
-              int s = inttof32(1 << m->shift);
-              glScalef32(s, s, s);
-              memset(anchor_of, 0, m->draw_count);
-              memset(taken, 0, m->draw_count);
-              // Forward on the ground, as a unit vector.
-              int fx = at[0] - eye[0], fz = at[2] - eye[2];
-              int len = (int)sqrt64((u64)((s64)fx * fx + (s64)fz * fz));
-              if (len == 0)
-                  len = 1;
-              fx = divf32(fx, len);
-              fz = divf32(fz, len);
-              // Sorted by distance, roughly: those that don't fit the budget are the farthest, in the haze.
-              for (int i = 0; i < NEAR_BUCKETS; i++)
-                  head[i] = -1;
-              for (int i = m->draw_count - 1; i >= 0; i--)
-              {
-                  const ModelDraw *d = &m->draws[i];
-                  int dx = d->chunk[0] - eye[0], dz = d->chunk[2] - eye[2];
-                  // (The chunk the player stands on: its floor under his feet. Never culled by the view.)
-                  int is_anchor = 0;
-                  if (anchor_on)
-                  {
-                      int ax_ = d->chunk[0] - anchor_pos[0], az_ = d->chunk[2] - anchor_pos[2], r_ = d->chunk[3];
-                      ax_ = ax_ < 0 ? -ax_ : ax_;
-                      az_ = az_ < 0 ? -az_ : az_;
-                      is_anchor = ax_ <= r_ && az_ <= r_ && anchor_pos[1] >= d->chunk[1] - r_ - ANCHOR_Y_MARGIN
-                                  && anchor_pos[1] <= d->chunk[1] + r_ + ANCHOR_Y_MARGIN;
-                  }
-                  // (Wholly behind the camera, with room to spare.)
-                  int fwd = ((s64)dx * fx + (s64)dz * fz) >> 12;
-                  if (!is_anchor && fwd < -(d->chunk[3] + BEHIND_MARGIN))
-                      continue;
-                  // (Wholly off to a side.)
-                  int lat = ((s64)dz * fx - (s64)dx * fz) >> 12;
-                  if (lat < 0)
-                      lat = -lat;
-                  if (!is_anchor && lat > mulf32(fwd > 0 ? fwd : 0, SIDE_TAN) + d->chunk[3] + SIDE_MARGIN)
-                      continue;
-                  // (The floor below, from a gallery above it.)
-                  if (cull_below && d->chunk[1] + d->chunk[3] < cull_below)
-                      continue;
-                  // (A room's inside from out of it, or the world outside from in it.)
-                  if (cull_mode)
-                  {
-                      int r = d->chunk[3];
-                      int in = d->chunk[0] - r > cull_box[0] && d->chunk[0] + r < cull_box[2] && d->chunk[2] - r > cull_box[1] && d->chunk[2] + r < cull_box[3];
-                      int out = d->chunk[0] + r < cull_box[0] || d->chunk[0] - r > cull_box[2] || d->chunk[2] + r < cull_box[1] || d->chunk[2] - r > cull_box[3];
-                      if ((cull_mode == CULL_INSIDE && in) || (cull_mode == CULL_OUTSIDE && out))
-                          continue;
-                  }
-                  anchor_of[i] = is_anchor;
-                  int ax = dx < 0 ? -dx : dx, az = dz < 0 ? -dz : dz;
-                  int b = (ax > az ? ax + az / 2 : az + ax / 2) - d->chunk[3];
-                  b = b < 0 ? 0 : b >> BUCKET_SHIFT;
-                  if (b >= NEAR_BUCKETS)
-                      b = NEAR_BUCKETS - 1;
-                  next[i] = head[b];
-                  head[b] = i;
-              }
-              int n = 0, left = budget, full = 0, anchors = 0, anchor_tris = 0;
-              // First the floor under the player, outside the budget (up to the cap).
-              for (int i = 0; i < m->draw_count; i++)
-              {
-                  if (!anchor_of[i])
-                      continue;
-                  int t = (int)m->draws[i].triangles;
-                  if (anchor_tris + t > ANCHOR_TRI_MAX && !(anchors == 0 && t <= ANCHOR_FIRST_MAX))
-                      continue;
-                  taken[i] = 1;
-                  anchors++;
-                  anchor_tris += t;
-                  left = left > t ? left - t : 0;
-                  chain_add(m, i, &n);
-              }
-              // Nearest first; once one doesn't fit, nothing farther is drawn (its own distance band is
-              // finished). Skipping just that one let smaller chunks behind it in: a big wall near the
-              // camera vanished, and the distance showed through it.
-              for (int b = 0; b < NEAR_BUCKETS && !full; b++)
-                  for (int i = head[b]; i >= 0; i = next[i])
-                  {
-                      const ModelDraw *d = &m->draws[i];
-                      if (taken[i])
-                          continue;
-                      if ((int)d->triangles > left)
-                      {
-                          full = 1;
-                          continue;
-                      }
-                      left -= d->triangles;
-                      chain_add(m, i, &n);
-                  }
-              // Last, the list's closing MTX_POP.
-              chain[n].src = m->async_list + m->async_words - 2;
-              chain[n++].words = 2;
-              chain_at = 0;
-              chain_n = n;
-              int irq = enterCriticalSection();
-              chain_next();
-              leaveCriticalSection(irq);
-          }
-
-          """
-          c = c[:a] + NEW + c[b:]
-          wr('model.c', c)
-
-          m = rd('main.c')
-          m = rep(m, "            model_draw_near(&stage, look_eye, look_at, stage_budget,", """            {
-                          int anchor[3] = { leon_pos[0], leon_feet, leon_pos[2] };
-                          model_set_anchor(anchor);   // the floor under Leon is never what the budget drops
-                      }
-                      model_draw_near(&stage, look_eye, look_at, stage_budget,""")
-          wr('main.c', m)
-          print("floor fix applied")
           RE4_EOF
           chmod +x symbian/tools/*.sh
           bash symbian/tools/prepare.sh
@@ -3956,6 +4505,27 @@ jobs:
             /Volumes/Symbian/gnupoc
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
+      - name: Enable GLES 2.0 (required)
+        run: |
+          set -eo pipefail
+          source toolchain/Scripts/env.sh
+          EPR="${EPOCROOT:-/Volumes/Symbian/sdks/symbian3/}epoc32"
+          LIBDIR="$EPR/release/armv5/lib"
+          EGL_LIB="$(ls "$LIBDIR" 2>/dev/null | grep -i '^libegl\.\(lib\|dso\)$' | head -1 || true)"
+          GLES_LIB="$(ls "$LIBDIR" 2>/dev/null | grep -i '^libglesv2\.\(lib\|dso\)$' | head -1 || true)"
+          echo "EGL header:   $(ls "$EPR/include/EGL/egl.h" 2>&1 | tail -1)"
+          echo "GLES2 header: $(ls "$EPR/include/GLES2/gl2.h" 2>&1 | tail -1)"
+          echo "EGL lib:      '$EGL_LIB'   GLES2 lib: '$GLES_LIB'"
+          if [ -f "$EPR/include/EGL/egl.h" ] && [ -f "$EPR/include/GLES2/gl2.h" ] && [ -n "$EGL_LIB" ] && [ -n "$GLES_LIB" ]; then
+            E="$(echo "$EGL_LIB" | sed 's/\.dso$/.lib/')"
+            G="$(echo "$GLES_LIB" | sed 's/\.dso$/.lib/')"
+            printf '\nMACRO           RE4_GLES2\nLIBRARY         %s %s\n' "$E" "$G" >> symbian/group/re4ds.mmp
+            echo "GLES 2.0 renderer ENABLED ($E $G)"
+          else
+            echo "ERROR: this SDK has no EGL + GLES 2.0 (headers/libs listed above). There is no software renderer any more, so the build stops here."
+            exit 1
+          fi
+
       - name: Build RE4 DS
         run: |
           set -eo pipefail
@@ -3976,13 +4546,111 @@ jobs:
           "$N8_REPO/Scripts/package-sis.sh" symbian/sis/re4ds.pkg "$GITHUB_WORKSPACE/dist"
           ls -l "$GITHUB_WORKSPACE/dist"
 
+      - name: Symbol table (to resolve stall addresses from re4ds.log)
+        run: |
+          source toolchain/Scripts/env.sh
+          D="${EPOCROOT:-/Volumes/Symbian/sdks/symbian3/}epoc32/release/gcce/urel"
+          ls -l "$D" | grep re4ds || true
+          NM="$(command -v arm-none-symbianelf-nm || true)"
+          echo "nm: $NM"
+          for f in "$D/re4ds.exe.sym" "$D/re4ds.exe"; do
+            if [ -f "$f" ] && [ -n "$NM" ]; then
+              "$NM" -n -C "$f" > "$GITHUB_WORKSPACE/dist/re4ds-symbols.txt" 2>/dev/null || true
+              [ -s "$GITHUB_WORKSPACE/dist/re4ds-symbols.txt" ] && echo "symbols from $f" && break
+            fi
+          done
+          ls -l "$GITHUB_WORKSPACE/dist"
+          exit 0
+
       - uses: actions/upload-artifact@v4
         with:
           name: re4ds-symbian3
           path: dist/re4ds.sisx
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: re4ds-symbols
+          path: dist/re4ds-symbols.txt
+          if-no-files-found: ignore
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/re4ds.sisx
+
+  convert-data:
+    name: Convert RE4 data (Windows)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.convert }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get the Zeebo zip
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force input | Out-Null
+          $url = '${{ inputs.zip_url }}'
+          $gid = '${{ inputs.gdrive_id }}'
+          if ($gid) {
+            python -m pip install --quiet gdown
+            python -m gdown $gid -O input/zeebo.zip
+            if ($LASTEXITCODE -ne 0) { throw 'gdown failed - is the file shared as "Anyone with the link"?' }
+          } elseif ($url) {
+            Invoke-WebRequest -Uri $url -OutFile input/zeebo.zip -MaximumRedirection 10
+          } else {
+            gh release download '${{ inputs.release_tag }}' --repo '${{ github.repository }}' --pattern '*.zip' --dir input --clobber
+            $z = Get-ChildItem input -Filter *.zip | Select-Object -First 1
+            if (-not $z) { throw 'no zip found in the release' }
+            Move-Item $z.FullName input/zeebo.zip -Force
+          }
+          $len = (Get-Item input/zeebo.zip).Length
+          Write-Host "zip size: $len bytes"
+          if ($len -lt 1MB) { throw 'downloaded file is too small - not the game zip (wrong link / login page?)' }
+
+      - name: Title picture placeholder (only if the repo has none)
+        shell: pwsh
+        run: |
+          $p = 'assets/title/title_ds_edition_source.png'
+          if (-not (Test-Path $p)) {
+            New-Item -ItemType Directory -Force assets/title | Out-Null
+            Add-Type -AssemblyName System.Drawing
+            $bmp = [System.Drawing.Bitmap]::new(1109, 832)
+            $bmp.Save((Join-Path (Get-Location) $p), [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose()
+            Write-Host 'wrote a black placeholder title picture'
+          }
+
+      - name: Convert
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse re4zeebo | Unblock-File
+          if (-not (Test-Path re4zeebo/export_all.ps1)) { throw 're4zeebo/export_all.ps1 is missing in this repository' }
+          ./re4zeebo/export_all.ps1 -InputPath (Resolve-Path input/zeebo.zip).Path -NoMusic
+
+      - name: Silent music.bin (the game needs the file to exist)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force ds/data | Out-Null
+          if (-not (Test-Path ds/data/music.bin)) {
+            # "RMU1", 0 tracks, 16384 Hz
+            [IO.File]::WriteAllBytes((Join-Path (Get-Location) 'ds/data/music.bin'), [byte[]](0x52,0x4D,0x55,0x31,0,0,0,0x40))
+            Write-Host 'wrote an empty music.bin'
+          }
+
+      - name: Pack for the phone
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out/RE4DS | Out-Null
+          Copy-Item ds/data out/RE4DS/data -Recurse
+          Copy-Item ds/nitrofs out/RE4DS/nitrofs -Recurse
+          Get-ChildItem out/RE4DS -Recurse -File | Measure-Object Length -Sum | ForEach-Object { Write-Host "$($_.Count) files, $([math]::Round($_.Sum/1MB,1)) MB" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RE4DS
+          path: out/RE4DS
+          retention-days: 1
