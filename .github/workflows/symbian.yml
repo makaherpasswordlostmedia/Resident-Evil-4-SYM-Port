@@ -2869,7 +2869,10 @@ jobs:
           {
               shim_trace("glColorTable");
               Tex *t = &tex[bound_tex];
-              if (!bound_tex || !t->idx) return 0;
+              if (!bound_tex) return 0;
+              /* direct-colour (GL_RGB) textures have no index buffer: they are already converted in
+                 glTexImageNtr2D, and the model loader still sends them an (empty) colour table */
+              if (!t->idx) return t->px ? 1 : 0;
               u32 n = (u32)t->w * t->h;
               u32 lut[256];
               for (int i = 0; i < 256; i++) lut[i] = i < count ? argb555(pal[i], 255) : 0;
