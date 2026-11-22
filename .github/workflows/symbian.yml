@@ -2133,6 +2133,7 @@ jobs:
           SOURCE          re4ds_app.cpp
           SOURCE          re4ds_container.cpp
           SOURCE          re4ds_audio.cpp
+          SOURCE          re4ds_gl.cpp
           SOURCE          re4ds_host.cpp
           SOURCE          re4ds_watch.cpp
 
