@@ -1454,6 +1454,12 @@ jobs:
                       t.iWrapT = ev.wrap_t;
                       SwapRB(t.iPx, ev.w * ev.h);
                       CreateGlTex(ev.id);
+                      static TInt texLog;
+                      if (texLog < 60)
+                          {
+                          ++texLog;
+                          Re4Log("tex up id %d %dx%d glerr %x", ev.id, (TInt)ev.w, (TInt)ev.h, (unsigned)glGetError());
+                          }
                       }
                   }
               }
@@ -1585,6 +1591,51 @@ jobs:
               glDisable(GL_BLEND);
               }
 
+          // diagnostic: reads the finished frame back and writes a 96x24 ASCII picture of it to re4ds.log
+          static void GlDumpFrame(TInt aW, TInt aH, TUint32* aBuf, TInt aBufBytes)
+              {
+              const TInt rows = 24, cols = 96;
+              TInt band = aH / rows;
+              if (band < 1) band = 1;
+              const TInt maxBand = aBufBytes / (aW * 4);
+              TInt bh = band < maxBand ? band : maxBand;
+              if (bh < 1)
+                  {
+                  return;
+                  }
+              char line[cols + 4];
+              for (TInt r = 0; r < rows; ++r)
+                  {
+                  TInt y = aH - (r + 1) * band;      // GL's origin is bottom-left: row r counted from the top
+                  if (y < 0)
+                      {
+                      y = 0;
+                      }
+                  glReadPixels(0, y, aW, bh, GL_RGBA, GL_UNSIGNED_BYTE, aBuf);
+                  const TUint8* p = (const TUint8*)aBuf;
+                  for (TInt c = 0; c < cols; ++c)
+                      {
+                      const TInt x0 = c * aW / cols, x1 = (c + 1) * aW / cols;
+                      TInt lit = 0, tot = 0;
+                      for (TInt yy = 0; yy < bh; ++yy)
+                          {
+                          for (TInt x = x0; x < x1; ++x)
+                              {
+                              const TUint8* q = p + (yy * aW + x) * 4;
+                              ++tot;
+                              if (q[0] + q[1] + q[2] > 120)
+                                  {
+                                  ++lit;
+                                  }
+                              }
+                          }
+                      line[c] = !lit ? ' ' : (lit * 8 < tot ? '.' : (lit * 3 < tot ? 'o' : '#'));
+                      }
+                  line[cols] = 0;
+                  Re4Log("GL%02d|%s|", r, line);
+                  }
+              }
+
           void CRe4Gl::Render()
               {
               if (!iOk)
@@ -1596,6 +1647,14 @@ jobs:
               ShimGlParams p;
               shim_gl_get_params(&p);
               UploadScreens();
+              static TInt dbgFrame;
+              ++dbgFrame;
+              const TBool dbg = (dbgFrame == 1 || dbgFrame == 120 || dbgFrame == 600);
+              if (dbg)
+                  {
+                  Re4Log("GLR #%d win %dx%d swap %d console %d dim3d %d bright %d/%d geo-verts %d upload-err %x", dbgFrame, iW, iH,
+                         p.swap, p.console, p.dim3d, p.bright_main, p.bright_sub, g ? (TInt)g->nv : -1, (unsigned)glGetError());
+                  }
 
               const TInt sw = iW / 2, sh = iH;
               const TInt mainX = p.swap ? sw : 0, subX = p.swap ? 0 : sw;
@@ -1631,6 +1690,15 @@ jobs:
               DrawTexQuad(iTexBot, EFalse);
               DrawSolid(p.bright_sub);
 
+              if (dbg)
+                  {
+                  Re4Log("GLR #%d draw-err %x batches %d (next: GL ASCII dump of the finished frame)", dbgFrame,
+                         (unsigned)glGetError(), g ? (TInt)g->nb : -1);
+                  if (dbgFrame > 1)
+                      {
+                      GlDumpFrame(iW, iH, iBuf, 256 * 192 * 4);
+                      }
+                  }
               if (!eglSwapBuffers((EGLDisplay)iDisplay, (EGLSurface)iSurface))
                   {
                   EGLint err = eglGetError();
@@ -2540,6 +2608,26 @@ jobs:
           void lcdMainOnTop(void) { lcd_swap = 0; }
           void lcdMainOnBottom(void) { lcd_swap = 1; }
 
+          /* diagnostic: a 64x24 ASCII picture of a 256x192 layer (one char = 4x8 px) in re4ds.log */
+          static void dump_ascii(const char *tag, const u32 *img)
+          {
+              char row[72], m[100];
+              for (int r = 0; r < 24; r++)
+              {
+                  for (int c = 0; c < 64; c++)
+                  {
+                      int lit = 0;
+                      for (int y = 0; y < 8; y++)
+                          for (int x = 0; x < 4; x++)
+                              if (img[(r * 8 + y) * 256 + c * 4 + x] & 0x00FFFFFFu) lit++;
+                      row[c] = lit == 0 ? ' ' : (lit < 5 ? '.' : (lit < 15 ? 'o' : '#'));
+                  }
+                  row[64] = 0;
+                  snprintf(m, sizeof m, "%s%02d|%s|", tag, r, row);
+                  host_log(m);
+              }
+          }
+
           void shim_present(void)
           {
               int lvl = 0;
@@ -2550,10 +2638,51 @@ jobs:
               /* the GLES renderer gets the sprite layer (with alpha) and the sub screen, and does the rest */
               memset(top, 0, sizeof top);
               draw_sprites(top);
+              {   /* diagnostic: what the sprite layer holds, once every ~180 presents (see re4ds.log "spr:") */
+                  static int dbg_n;
+                  if (++dbg_n % 180 == 1)
+                  {
+                      char m[160];
+                      int vis = 0, shown = 0, nz = 0, x0 = 256, x1 = -1, y0 = 192, y1 = -1, gz = 0;
+                      for (int i = 0; i < (int)sizeof(shim_spr_gfx); i++) if (shim_spr_gfx[i]) gz++;
+                      for (int i = 0; i < 128; i++) if (!spr[i].hide) vis++;
+                      for (int i = 0; i < 256 * 192; i++)
+                          if (top[i])
+                          {
+                              int px = i & 255, py = i >> 8;
+                              nz++;
+                              if (px < x0) x0 = px; if (px > x1) x1 = px;
+                              if (py < y0) y0 = py; if (py > y1) y1 = py;
+                          }
+                      snprintf(m, sizeof m, "spr: visible %d, opaque px %d, bbox x%d..%d y%d..%d, console %d, sprite-gfx nonzero bytes %d",
+                               vis, nz, x0, x1, y0, y1, (int)shim_console_on, gz);
+                      host_log(m);
+                      for (int i = 0; i < 128 && shown < 6; i++)
+                          if (!spr[i].hide)
+                          {
+                              snprintf(m, sizeof m, "spr[%d]: x%d y%d off%d pal%d dbl%d aff%d", i, spr[i].x, spr[i].y,
+                                       spr[i].off, spr[i].pal, (int)spr[i].dbl, spr[i].aff);
+                              host_log(m);
+                              shown++;
+                          }
+                  }
+              }
               for (int i = 0; i < 256 * 192; i++)
               {
                   u16 c = sub_vram[i];
                   bot[i] = 0xFF000000u | ((!shim_console_on && (c & 0x8000)) ? rgb555(c) : 0);
+              }
+              {
+                  static int dbg2;
+                  dbg2++;
+                  if (dbg2 == 120 || dbg2 == 600)
+                  {
+                      char m[80];
+                      snprintf(m, sizeof m, "ASCII dump at present #%d: SHIM-TOP (sprite layer) then SHIM-BOT (sub screen)", dbg2);
+                      host_log(m);
+                      dump_ascii("ST", top);
+                      dump_ascii("SB", bot);
+                  }
               }
               host_lock();
               memcpy(shim_top, top, sizeof top);
