@@ -1259,7 +1259,7 @@ jobs:
                   Re4Log("gles: eglInitialize failed %x", (unsigned)eglGetError());
                   User::Leave(KErrNotSupported);
                   }
-              iDisplay = d;
+              iDisplay = (TAny*)(TUint)d;
               eglBindAPI(EGL_OPENGL_ES_API);
 
               static const EGLint attrA[] = { EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
@@ -1285,14 +1285,14 @@ jobs:
                   Re4Log("gles: no ES2 window config");
                   User::Leave(KErrNotSupported);
                   }
-              iConfig = cfg;
+              iConfig = (TAny*)(TUint)cfg;
               EGLSurface surf = eglCreateWindowSurface(d, cfg, &aWindow, NULL);
               if (surf == EGL_NO_SURFACE)
                   {
                   Re4Log("gles: eglCreateWindowSurface failed %x", (unsigned)eglGetError());
                   User::Leave(KErrNotSupported);
                   }
-              iSurface = surf;
+              iSurface = (TAny*)(TUint)surf;
               static const EGLint ctxAttr[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
               EGLContext ctx = eglCreateContext(d, cfg, EGL_NO_CONTEXT, ctxAttr);
               if (ctx == EGL_NO_CONTEXT)
@@ -1300,7 +1300,7 @@ jobs:
                   Re4Log("gles: eglCreateContext failed %x", (unsigned)eglGetError());
                   User::Leave(KErrNotSupported);
                   }
-              iContext = ctx;
+              iContext = (TAny*)(TUint)ctx;
               if (!eglMakeCurrent(d, surf, surf, ctx))
                   {
                   Re4Log("gles: eglMakeCurrent failed %x", (unsigned)eglGetError());
@@ -1447,7 +1447,7 @@ jobs:
                   if (ev.kind == 1 && ev.px)
                       {
                       TTex& t = iTex[ev.id];
-                      t.iPx = ev.px;                         // the pixels are ours now (shared heap)
+                      t.iPx = (TUint32*)ev.px;                         // the pixels are ours now (shared heap)
                       t.iW = ev.w;
                       t.iH = ev.h;
                       t.iWrapS = ev.wrap_s;
