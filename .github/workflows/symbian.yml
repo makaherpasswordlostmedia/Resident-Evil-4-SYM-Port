@@ -722,7 +722,7 @@ jobs:
 
               // the game: own thread, 512 KB stack, sharing the UI heap (textures are handed to the GL side
               // and freed there; the heap max is EPOCHEAPSIZE in the .mmp)
-              TInt err = iGame.Create(_L("re4ds_game"), Re4GameThread, 0x80000, NULL, EOwnerProcess);
+              TInt err = iGame.Create(_L("re4ds_game"), Re4GameThread, 0x80000, (RAllocator*)NULL, (TAny*)NULL, EOwnerProcess);
               Re4Log("container: game thread create %d", err);
               User::LeaveIfError(err);
               iGame.SetPriority(EPriorityLess);      // the UI thread always wins
@@ -1984,7 +1984,8 @@ jobs:
                   Mem::FillZ(regs, sizeof(regs));
                   TPtr8 d((TUint8*)regs, 0, sizeof(regs));
                   t.Suspend();
-                  err = t.Context(d);
+                  t.Context(d);               // returns void on Symbian^3
+                  err = KErrNone;
                   t.Resume();
                   Re4Log("  %s ctx%d err=%d pc=%08x lr=%08x sp=%08x", aWho, i, err, (unsigned)regs[15],
                          (unsigned)regs[14], (unsigned)regs[13]);
@@ -2015,7 +2016,7 @@ jobs:
               TUint lastUi = shim_ui_ticks;
               TInt frameStall = 0, uiStall = 0;
               TBool deathLogged = EFalse;
-              Re4Log("watchdog: running (1 line per second: frames/ui ticks gained, free RAM, game heap)");
+              Re4Log("watchdog: running (1 line per second: frames/ui ticks gained, free RAM)");
               while (!gStop)
                   {
                   User::After(1000000);
@@ -2027,17 +2028,12 @@ jobs:
                   TUint u = shim_ui_ticks;
                   TInt ramFree = 0;
                   HAL::Get(HALData::EMemoryRAMFree, ramFree);
-                  TInt heap = 0, stack = 0;
                   RThread g;
                   TBool haveGame = g.Open(gGameId) == KErrNone;
-                  if (haveGame)
-                      {
-                      g.GetRamSizes(heap, stack);
-                      }
                   char tail[120];
                   shim_trace_tail(tail, sizeof(tail), 5);
-                  Re4Log("wd: frame +%u ui +%u | free RAM %d KB | game heap %d KB | in '%s' | %s", f - lastFrame,
-                         u - lastUi, ramFree / 1024, heap / 1024, shim_where ? shim_where : "?", tail);
+                  Re4Log("wd: frame +%u ui +%u | free RAM %d KB | in '%s' | %s", f - lastFrame,
+                         u - lastUi, ramFree / 1024, shim_where ? shim_where : "?", tail);
 
                   if (haveGame && !deathLogged && g.ExitType() != EExitPending)
                       {
@@ -3379,7 +3375,7 @@ jobs:
           {
               TexNode *n = (TexNode *)malloc(sizeof(TexNode));
               if (!n) { if (px) free(px); return; }
-              n->ev.kind = kind; n->ev.id = id; n->ev.w = w; n->ev.h = h; n->ev.wrap_s = ws; n->ev.wrap_t = wt; n->ev.px = px;
+              n->ev.kind = kind; n->ev.id = id; n->ev.w = w; n->ev.h = h; n->ev.wrap_s = ws; n->ev.wrap_t = wt; n->ev.px = (unsigned int *)px;
               n->next = 0;
               host_lock();
               if (tex_tail) tex_tail->next = n; else tex_head = n;
